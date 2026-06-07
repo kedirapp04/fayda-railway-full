@@ -1,0 +1,370 @@
+const path = require("path");
+const fs = require("fs");
+const TelegramBot = require("node-telegram-bot-api");
+const env = require("../config/env");
+const store = require("../services/store.service");
+
+let bot = null;
+
+const isAdmin = (tgId) => env.ADMIN_TELEGRAM_IDS.includes(String(tgId));
+const TESTER_PATH = path.join(__dirname, "..", "..", "tester.html");
+const DOCS_PATH = path.join(__dirname, "..", "..", "userusage.md");
+
+function notifyAdmins(text) {
+  if (!bot) return;
+  env.ADMIN_TELEGRAM_IDS.forEach((id) => bot.sendMessage(id, text).catch(() => {}));
+}
+
+function requireUsername(from, chatId) {
+  if (!from.username) {
+    bot.sendMessage(chatId, "⚠️ A Telegram username is required.\nSet one in Settings → Username, then tap /start again.");
+    return false;
+  }
+  return true;
+}
+
+// Admins are always approved — they never request access.
+async function ensureUser(from) {
+  const u = await store.getOrCreateUser(from.id, from.username);
+  if (isAdmin(from.id) && u.status !== "approved") return store.setUserStatus(u.id, "approved");
+  return u;
+}
+
+// ─── Menus (pure formatting from a stats object — sync) ──────────────────────
+function billingLine(s) {
+  if (s.billingMode === "prepaid") return `💳 Prepaid · balance ${s.balance} · ${s.price}/gen`;
+  if (s.billingMode === "postpaid") return `💳 Postpaid · owed ${s.owed}/${s.creditLimit || "∞"} · ${s.price}/gen`;
+  return `🔢 Counter · used ${s.totalSuccess}${s.totalLimit ? "/" + s.totalLimit : ""}`;
+}
+
+function userMenuText(u, s) {
+  const who = u.username ? "@" + u.username : "your account";
+  return `👤 ${who} — ${u.status}\n` +
+    `Key: ${s.key ? s.key.key_prefix + "… (" + s.key.status + ")" : "none"}\n` +
+    `${billingLine(s)}\nGenerations: ${s.totalSuccess}${s.savedTotal ? " (+" + s.savedTotal + " saved)" : ""}`;
+}
+
+async function userMenu(u, viewerIsAdmin) {
+  const s = await store.getUserStats(u.id);
+  const rows = [];
+  const active = u.status === "approved" || u.status === "trial";
+  if (active) {
+    rows.push([{ text: "📊 My Usage", callback_data: "u:usage" }, { text: "📁 My Saves", callback_data: "u:saves" }]);
+    if (s.key && s.key.status === "active") rows.push([{ text: "⏸ Pause Key", callback_data: "u:pausekey" }, { text: "🗑 Revoke & Replace", callback_data: "u:revokekey" }]);
+    else if (s.key && s.key.status === "paused") rows.push([{ text: "▶️ Resume Key", callback_data: "u:resumekey" }, { text: "🗑 Revoke & Replace", callback_data: "u:revokekey" }]);
+    else rows.push([{ text: "🗑 Revoke & Replace", callback_data: "u:revokekey" }]);
+    if (u.status === "trial") rows.push([{ text: "📨 Request Full Access + Docs", callback_data: "u:request" }]);
+  } else {
+    if (!u.trial_claimed) rows.push([{ text: `🎁 Free Tester Key (${env.TRIAL_REWARD_COUNT})`, callback_data: "u:tester" }]);
+    rows.push([{ text: "📨 Request Full Access + Docs", callback_data: "u:request" }, { text: "📊 My Usage", callback_data: "u:usage" }]);
+  }
+  if (viewerIsAdmin) rows.push([{ text: "🛠 Admin Panel", callback_data: "a:panel" }]);
+  return { text: userMenuText(u, s), markup: { reply_markup: { inline_keyboard: rows } } };
+}
+
+async function adminPanel() {
+  return { reply_markup: { inline_keyboard: [
+    [{ text: "⏳ Pending", callback_data: "a:pending" }, { text: "👥 Users", callback_data: "a:users" }],
+    [{ text: `🌐 Global price: ${await store.globalPrice()}`, callback_data: "a:gprice" }],
+    [{ text: "🔄 Refresh", callback_data: "a:panel" }]
+  ] } };
+}
+
+async function gpriceMenu() {
+  return {
+    text: `🌐 Global price per generation: ${await store.globalPrice()}\nSet a new default (per-user overrides still win). Use /gprice <n> for any value.`,
+    markup: { reply_markup: { inline_keyboard: [
+      [{ text: "5", callback_data: "a:gset:5" }, { text: "10", callback_data: "a:gset:10" }, { text: "20", callback_data: "a:gset:20" }, { text: "50", callback_data: "a:gset:50" }],
+      [{ text: "⬅ Panel", callback_data: "a:panel" }]
+    ] } }
+  };
+}
+
+function moneyLine(u, s) {
+  if (s.billingMode === "prepaid") return `balance ${s.balance}`;
+  if (s.billingMode === "postpaid") return `owed ${s.owed}/${s.creditLimit || "∞"}`;
+  return `limits d:${u.daily_limit || "∞"} t:${u.total_limit || "∞"}`;
+}
+
+async function userCard(u) {
+  const s = await store.getUserStats(u.id);
+  const text =
+    `👤 ${u.username ? "@" + u.username : "(no username)"}  ·  id #${u.id}\n` +
+    `status: ${u.status} · mode: ${s.billingMode}\n` +
+    `price: ${s.price}${s.priceOverride != null ? " (override)" : " (global)"} · ${moneyLine(u, s)}\n` +
+    `key: ${s.key ? s.key.key_prefix + "… (" + s.key.status + ")" : "none"}\n` +
+    `gens: today ${s.todaySuccess} · period ${s.totalSuccess} · saved ${s.savedTotal} · life ${s.lifetime}`;
+  const rows = [];
+  if (u.status !== "approved") rows.push([{ text: "✅ Approve + Docs", callback_data: `a:approve:${u.id}` }]);
+  if (u.status === "paused") rows.push([{ text: "▶️ Resume", callback_data: `a:resume:${u.id}` }]);
+  else if (u.status === "approved" || u.status === "trial") rows.push([{ text: "⏸ Pause", callback_data: `a:pause:${u.id}` }]);
+  rows.push([{ text: "💳 Billing", callback_data: `a:billing:${u.id}` }, { text: "📏 Limits", callback_data: `a:limits:${u.id}` }]);
+  rows.push([{ text: "💾 Save & reset", callback_data: `a:save:${u.id}` }, { text: "📁 Saves", callback_data: `a:saves:${u.id}` }]);
+  rows.push([{ text: "📄 Send Docs", callback_data: `a:senddocs:${u.id}` }, { text: "🗑 Revoke", callback_data: `a:revoke:${u.id}` }]);
+  rows.push([{ text: "🔄 Refresh", callback_data: `a:user:${u.id}` }, { text: "⬅ Users", callback_data: "a:users" }]);
+  return { text, markup: { reply_markup: { inline_keyboard: rows } } };
+}
+
+async function billingMenu(u) {
+  const s = await store.getUserStats(u.id);
+  const text = `💳 Billing — ${u.username ? "@" + u.username : "#" + u.id}\n` +
+    `Mode: ${s.billingMode} · price: ${s.price}${s.priceOverride != null ? " (override)" : " (global)"}\n` +
+    `Prepaid balance: ${s.balance}\nPostpaid owed: ${s.owed}/${s.creditLimit || "∞"}`;
+  const id = u.id;
+  return { text, markup: { reply_markup: { inline_keyboard: [
+    [{ text: (s.billingMode === "counter" ? "● " : "") + "🔢 Counter", callback_data: `a:mode:${id}:counter` },
+     { text: (s.billingMode === "prepaid" ? "● " : "") + "💰 Prepaid", callback_data: `a:mode:${id}:prepaid` },
+     { text: (s.billingMode === "postpaid" ? "● " : "") + "🧾 Postpaid", callback_data: `a:mode:${id}:postpaid` }],
+    [{ text: "Top +50", callback_data: `a:topup:${id}:50` }, { text: "+100", callback_data: `a:topup:${id}:100` }, { text: "+500", callback_data: `a:topup:${id}:500` }],
+    [{ text: "Price 5", callback_data: `a:price:${id}:5` }, { text: "10", callback_data: `a:price:${id}:10` }, { text: "20", callback_data: `a:price:${id}:20` }, { text: "Global", callback_data: `a:price:${id}:clear` }],
+    [{ text: "Credit 100", callback_data: `a:credit:${id}:100` }, { text: "500", callback_data: `a:credit:${id}:500` }, { text: "1000", callback_data: `a:credit:${id}:1000` }],
+    [{ text: "🧾 Settle owed", callback_data: `a:settle:${id}` }, { text: "⬅ Back", callback_data: `a:user:${id}` }]
+  ] } } };
+}
+
+function limitsMenu(u) {
+  return {
+    text: `📏 Limits for ${u.username ? "@" + u.username : "#" + u.id}\nDaily: ${u.daily_limit || "∞"} · Total: ${u.total_limit || "∞"}`,
+    markup: { reply_markup: { inline_keyboard: [
+      [{ text: "Daily 10", callback_data: `a:daily:${u.id}:10` }, { text: "50", callback_data: `a:daily:${u.id}:50` }, { text: "100", callback_data: `a:daily:${u.id}:100` }, { text: "∞", callback_data: `a:daily:${u.id}:0` }],
+      [{ text: "Total 15", callback_data: `a:total:${u.id}:15` }, { text: "100", callback_data: `a:total:${u.id}:100` }, { text: "500", callback_data: `a:total:${u.id}:500` }, { text: "∞", callback_data: `a:total:${u.id}:0` }],
+      [{ text: "⬅ Back", callback_data: `a:user:${u.id}` }]
+    ] } }
+  };
+}
+
+async function adminSavesMenu(u) {
+  const saves = await store.listSaves(u.id);
+  const total = await store.savesTotal(u.id);
+  const lines = saves.length
+    ? saves.map((sv) => `#${sv.id}: ${sv.saved_count} — ${sv.saved_at.slice(0, 16).replace("T", " ")}`).join("\n")
+    : "(no saves yet)";
+  const rows = saves.slice(0, 12).map((sv) => [{ text: `🗑 Clear #${sv.id} (${sv.saved_count})`, callback_data: `a:clearsave:${sv.id}:${u.id}` }]);
+  rows.push([{ text: "⬅ Back", callback_data: `a:user:${u.id}` }]);
+  return { text: `📁 Saves for ${u.username ? "@" + u.username : "#" + u.id} — total ${total}\n\n${lines}`, markup: { reply_markup: { inline_keyboard: rows } } };
+}
+
+async function userSavesText(u) {
+  const s = await store.getUserStats(u.id);
+  const saves = await store.listSaves(u.id);
+  const lines = saves.length ? saves.map((sv) => `• ${sv.saved_count} — ${sv.saved_at.slice(0, 10)}`).join("\n") : "(no saved periods yet)";
+  return `📁 Your usage\n${billingLine(s)}\nGenerations: ${s.totalSuccess}${s.totalLimit ? "/" + s.totalLimit : ""} · saved ${s.savedTotal} · lifetime ${s.lifetime}\n\n${lines}`;
+}
+
+// ─── Senders ────────────────────────────────────────────────────────────
+async function sendTester(chatId) {
+  try { if (fs.existsSync(TESTER_PATH)) await bot.sendDocument(chatId, TESTER_PATH, { caption: "🧪 Open tester.html in a browser, paste your key, and test the flow." }, { filename: "tester.html", contentType: "text/html" }); } catch (_) {}
+}
+async function sendDocs(chatId) {
+  try { if (fs.existsSync(DOCS_PATH)) await bot.sendDocument(chatId, DOCS_PATH, { caption: "📄 Developer usage guide." }, { filename: "userusage.md", contentType: "text/markdown" }); } catch (_) {}
+  try { if (fs.existsSync(TESTER_PATH)) await bot.sendDocument(chatId, TESTER_PATH, {}, { filename: "tester.html", contentType: "text/html" }); } catch (_) {}
+}
+function sendKey(chatId, rawKey, prefix) {
+  return bot.sendMessage(chatId,
+    `${prefix}\n\n<code>${rawKey}</code>\n\nSend it as the <b>x-api-key</b> header to POST /api/session and /api/session/:id/verify.`,
+    { parse_mode: "HTML" });
+}
+
+function start() {
+  if (!env.ENABLE_TELEGRAM_BOT || !env.TELEGRAM_BOT_TOKEN) {
+    console.error("Telegram bot disabled (no token or ENABLE_TELEGRAM_BOT=false).");
+    return null;
+  }
+  bot = new TelegramBot(env.TELEGRAM_BOT_TOKEN, { polling: true });
+
+  bot.setMyCommands([
+    { command: "menu", description: "Open the menu" },
+    { command: "tester", description: "Free tester key + tool" },
+    { command: "start", description: "Start / register" }
+  ]).catch(() => {});
+  bot.setChatMenuButton({ menu_button: { type: "commands" } }).catch(() => {});
+
+  const openMenu = async (msg) => {
+    if (!requireUsername(msg.from, msg.chat.id)) return;
+    const u = await ensureUser(msg.from);
+    const m = await userMenu(u, isAdmin(msg.from.id));
+    bot.sendMessage(msg.chat.id, m.text, m.markup);
+  };
+  bot.onText(/^\/start\b/, openMenu);
+  bot.onText(/^\/menu\b/, openMenu);
+  bot.onText(/^\/admin\b/, async (msg) => { if (isAdmin(msg.from.id)) bot.sendMessage(msg.chat.id, "🛠 Admin Panel", await adminPanel()); });
+  bot.onText(/^\/tester\b/, async (msg) => {
+    if (!requireUsername(msg.from, msg.chat.id)) return;
+    await claimTesterFlow(msg.chat.id, await ensureUser(msg.from));
+  });
+  bot.onText(/^\/setlimit\s+(\d+)\s+(\d+)\s+(\d+)/, async (msg, m) => {
+    if (!isAdmin(msg.from.id)) return;
+    const u = await store.setLimits(m[1], m[2], m[3]);
+    bot.sendMessage(msg.chat.id, u ? `📏 #${u.id}: daily ${u.daily_limit || "∞"}, total ${u.total_limit || "∞"}.` : "No such user.");
+  });
+  // ── Billing commands (admin, arbitrary amounts) ──
+  bot.onText(/^\/gprice\s+([\d.]+)/, async (msg, m) => {
+    if (!isAdmin(msg.from.id)) return;
+    bot.sendMessage(msg.chat.id, `🌐 Global price → ${await store.setGlobalPrice(m[1])}`);
+  });
+  bot.onText(/^\/price\s+(\d+)\s+([\d.]+|global)/i, async (msg, m) => {
+    if (!isAdmin(msg.from.id)) return;
+    const u = await store.setPrice(m[1], /global/i.test(m[2]) ? "" : m[2]);
+    bot.sendMessage(msg.chat.id, u ? `Price for #${u.id}: ${u.price_override != null ? u.price_override : "global (" + (await store.globalPrice()) + ")"}` : "No such user.");
+  });
+  bot.onText(/^\/topup\s+(\d+)\s+([\d.]+)/, async (msg, m) => {
+    if (!isAdmin(msg.from.id)) return;
+    const u = await store.topUp(m[1], m[2]);
+    bot.sendMessage(msg.chat.id, u ? `💰 #${u.id} balance: ${u.balance}` : "No such user.");
+  });
+  bot.onText(/^\/credit\s+(\d+)\s+([\d.]+)/, async (msg, m) => {
+    if (!isAdmin(msg.from.id)) return;
+    const u = await store.setCreditLimit(m[1], m[2]);
+    bot.sendMessage(msg.chat.id, u ? `🧾 #${u.id} credit limit: ${u.credit_limit}` : "No such user.");
+  });
+  bot.onText(/^\/mode\s+(\d+)\s+(counter|prepaid|postpaid)/i, async (msg, m) => {
+    if (!isAdmin(msg.from.id)) return;
+    const u = await store.setBillingMode(m[1], m[2].toLowerCase());
+    bot.sendMessage(msg.chat.id, u ? `💳 #${u.id} mode: ${u.billing_mode}` : "No such user.");
+  });
+  bot.onText(/^\/settle\s+(\d+)/, async (msg, m) => {
+    if (!isAdmin(msg.from.id)) return;
+    const u = await store.settleOwed(m[1]);
+    bot.sendMessage(msg.chat.id, u ? `🧾 #${u.id} owed reset to 0` : "No such user.");
+  });
+
+  async function claimTesterFlow(chatId, u) {
+    if (u.trial_claimed) {
+      await bot.sendMessage(chatId, "ℹ️ You already claimed your free tester key. Use the menu (Revoke & Replace to get a fresh key, My Usage to check your count).");
+      await sendTester(chatId);
+      return;
+    }
+    const res = await store.claimTrial(u.id, env.TRIAL_REWARD_COUNT);
+    if (!res) { await bot.sendMessage(chatId, "ℹ️ Trial already claimed."); return; }
+    await sendKey(chatId, res.rawKey, `🎁 Reward: ${env.TRIAL_REWARD_COUNT} free generations!\n🔑 Your tester API key (shown once):`);
+    await sendTester(chatId);
+    await bot.sendMessage(chatId, "📄 For the full developer guide, tap “Request Full Access + Docs”.");
+  }
+
+  bot.on("callback_query", async (q) => {
+    const fromId = q.from.id;
+    const chatId = q.message.chat.id;
+    const msgId = q.message.message_id;
+    const data = String(q.data || "");
+    const ack = (text) => bot.answerCallbackQuery(q.id, text ? { text } : undefined).catch(() => {});
+    const edit = (text, markup) => bot.editMessageText(text, { chat_id: chatId, message_id: msgId, ...(markup || {}) }).catch(() => {});
+    const reRenderMenu = async (u) => { const m = await userMenu(u, isAdmin(fromId)); return edit(m.text, m.markup); };
+
+    try {
+      if (data.startsWith("u:")) {
+        if (!q.from.username) return ack("Set a Telegram username first");
+        const u = await ensureUser(q.from);
+        const action = data.slice(2);
+        if (action === "request") {
+          if (u.status === "approved") ack("Already approved");
+          else { await store.setUserStatus(u.id, "pending"); ack("Request sent — admin will review"); notifyAdmins(`🆕 Access+docs request from @${u.username || "?"} (id #${u.id})`); }
+        } else if (action === "usage" || action === "saves") { ack(); await bot.sendMessage(chatId, await userSavesText(u)); }
+        else if (action === "tester") { ack("Issuing tester key…"); await claimTesterFlow(chatId, u); }
+        else if (action === "pausekey") { await store.setKeyStatus(u.id, "paused"); ack("Key paused"); }
+        else if (action === "resumekey") { await store.setKeyStatus(u.id, "active"); ack("Key active"); }
+        else if (action === "revokekey") {
+          const { rawKey } = await store.revokeAndReissue(u.id);
+          ack("Old key deleted · new key issued");
+          await sendKey(chatId, rawKey, "🗑→🔑 Old key deleted. Your usage is kept.\nNew API key (shown once):");
+        }
+        return reRenderMenu(await store.getUserById(u.id));
+      }
+
+      if (data.startsWith("a:")) {
+        if (!isAdmin(fromId)) return ack("Admins only");
+        const parts = data.split(":");
+        const action = parts[1];
+
+        if (action === "panel") { ack(); return edit("🛠 Admin Panel", await adminPanel()); }
+        if (action === "pending" || action === "users") {
+          ack();
+          const list = action === "pending" ? await store.listPendingUsers() : await store.listUsers();
+          if (!list.length) return edit(action === "pending" ? "⏳ No pending requests." : "👥 No users yet.", await adminPanel());
+          const rows = list.slice(0, 12).map((u) => [{ text: `${u.username ? "@" + u.username : u.telegram_id} · #${u.id} (${u.status})`, callback_data: `a:user:${u.id}` }]);
+          rows.push([{ text: "⬅ Panel", callback_data: "a:panel" }]);
+          return edit(`${action === "pending" ? "⏳ Pending" : "👥 Users"} (${list.length})`, { reply_markup: { inline_keyboard: rows } });
+        }
+        if (action === "gprice") { ack(); const gm = await gpriceMenu(); return edit(gm.text, gm.markup); }
+        if (action === "gset") { await store.setGlobalPrice(parts[2]); ack(`Global price → ${parts[2]}`); const gm = await gpriceMenu(); return edit(gm.text, gm.markup); }
+
+        const target = await store.getUserById(parts[2]);
+        if (!target) return ack("No such user");
+
+        if (action === "user") { ack(); const c = await userCard(target); return edit(c.text, c.markup); }
+        if (action === "limits") { ack(); const lm = limitsMenu(target); return edit(lm.text, lm.markup); }
+        if (action === "saves") { ack(); const sm = await adminSavesMenu(target); return edit(sm.text, sm.markup); }
+
+        if (action === "approve") {
+          await store.setUserStatus(target.id, "approved");
+          // Approved = unlimited counter. Reset billing to counter and clear any
+          // leftover trial cap so approval never stops at the trial limit.
+          await store.setBillingMode(target.id, "counter");
+          await store.setLimits(target.id, 0, 0);
+          const { rawKey } = await store.issueKey(target.id);
+          ack("Approved (unlimited) + key + docs sent");
+          if (target.telegram_id) {
+            await sendKey(target.telegram_id, rawKey, "🎉 Approved! Your API key (shown once):").catch(() => {});
+            await bot.sendMessage(target.telegram_id, "✅ Your account is approved — unlimited generations.").catch(() => {});
+            await sendDocs(target.telegram_id);
+          }
+        } else if (action === "billing") {
+          ack(); const bm = await billingMenu(target); return edit(bm.text, bm.markup);
+        } else if (action === "mode") {
+          await store.setBillingMode(target.id, parts[3]); ack(`Mode → ${parts[3]}`);
+          const bm = await billingMenu(await store.getUserById(target.id)); return edit(bm.text, bm.markup);
+        } else if (action === "topup") {
+          await store.topUp(target.id, parts[3]); ack(`+${parts[3]} added`);
+          const bm = await billingMenu(await store.getUserById(target.id)); return edit(bm.text, bm.markup);
+        } else if (action === "price") {
+          await store.setPrice(target.id, parts[3] === "clear" ? "" : parts[3]); ack("Price set");
+          const bm = await billingMenu(await store.getUserById(target.id)); return edit(bm.text, bm.markup);
+        } else if (action === "credit") {
+          await store.setCreditLimit(target.id, parts[3]); ack(`Credit limit ${parts[3]}`);
+          const bm = await billingMenu(await store.getUserById(target.id)); return edit(bm.text, bm.markup);
+        } else if (action === "settle") {
+          await store.settleOwed(target.id); ack("Owed reset to 0");
+          const bm = await billingMenu(await store.getUserById(target.id)); return edit(bm.text, bm.markup);
+        } else if (action === "senddocs") {
+          ack("Docs sent");
+          if (target.telegram_id) await sendDocs(target.telegram_id).catch(() => {});
+        } else if (action === "pause") {
+          await store.setUserStatus(target.id, "paused"); ack("Paused");
+          if (target.telegram_id) bot.sendMessage(target.telegram_id, "⏸️ Your API access was paused by an admin.").catch(() => {});
+        } else if (action === "resume") {
+          await store.setUserStatus(target.id, "approved"); ack("Resumed");
+          if (target.telegram_id) bot.sendMessage(target.telegram_id, "▶️ Your API access was resumed.").catch(() => {});
+        } else if (action === "revoke") {
+          await store.setUserStatus(target.id, "revoked"); await store.setKeyStatus(target.id, "revoked"); ack("Revoked");
+          if (target.telegram_id) bot.sendMessage(target.telegram_id, "🗑️ Your API access was revoked.").catch(() => {});
+        } else if (action === "daily") {
+          await store.setLimits(target.id, parts[3], target.total_limit); ack("Daily set");
+          const lm = limitsMenu(await store.getUserById(target.id)); return edit(lm.text, lm.markup);
+        } else if (action === "total") {
+          await store.setLimits(target.id, target.daily_limit, parts[3]); ack("Total set");
+          const lm = limitsMenu(await store.getUserById(target.id)); return edit(lm.text, lm.markup);
+        } else if (action === "save") {
+          const saved = await store.saveCounterAndReset(target.id); ack(`Saved ${saved}, counter reset`);
+        } else if (action === "clearsave") {
+          await store.clearSave(parts[2]); ack("Save cleared");
+          const owner = await store.getUserById(parts[3]);
+          if (owner) { const sm = await adminSavesMenu(owner); return edit(sm.text, sm.markup); }
+          return edit("🛠 Admin Panel", await adminPanel());
+        }
+
+        const c = await userCard(await store.getUserById(target.id));
+        return edit(c.text, c.markup);
+      }
+
+      ack();
+    } catch (err) {
+      console.warn("[tg callback error]", err?.message || err);
+      ack("Error");
+    }
+  });
+
+  bot.on("polling_error", (err) => console.warn("[tg polling_error]", err?.message || err));
+  console.error(`Telegram management bot started (button UI, ${env.ADMIN_TELEGRAM_IDS.length} admin(s)).`);
+  return bot;
+}
+
+module.exports = { start };

@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Fayda API Tester — Gateway + Generator</title>
+<style>
+  :root { --bg:#0f1420; --card:#1a2233; --line:#2a3550; --txt:#e6ecf5; --mut:#8aa0c0; --ac:#4f8cff; --ok:#2ecc71; --err:#ff5a6a; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.5 system-ui,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--txt); }
+  .wrap { max-width:880px; margin:0 auto; padding:24px 16px 60px; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  .sub { color:var(--mut); margin:0 0 20px; font-size:13px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:18px; margin-bottom:16px; }
+  .card h2 { font-size:15px; margin:0 0 12px; display:flex; align-items:center; gap:8px; }
+  .badge { font-size:11px; background:#24304a; color:var(--mut); border-radius:20px; padding:2px 9px; }
+  label { display:block; font-size:12px; color:var(--mut); margin:10px 0 4px; }
+  input[type=text], input[type=password], select {
+    width:100%; background:#0d1322; border:1px solid var(--line); color:var(--txt);
+    border-radius:8px; padding:9px 11px; font:inherit; }
+  .row { display:flex; gap:10px; flex-wrap:wrap; }
+  .row > div { flex:1; min-width:180px; }
+  .keyrow { display:flex; gap:6px; }
+  .keyrow input { flex:1; }
+  .eye { margin-top:0; padding:9px 12px; background:#27334d; font-weight:500; }
+  button { background:var(--ac); color:#fff; border:0; border-radius:8px; padding:9px 16px;
+    font:inherit; font-weight:600; cursor:pointer; margin-top:12px; }
+  button.sec { background:#27334d; }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  .status { font-size:13px; margin-top:10px; min-height:18px; }
+  .status.ok { color:var(--ok); } .status.err { color:var(--err); }
+  pre { background:#0a0f1c; border:1px solid var(--line); border-radius:8px; padding:10px;
+    font-size:12px; overflow:auto; max-height:220px; margin:10px 0 0; white-space:pre-wrap; word-break:break-word; }
+  .imgs img { max-width:200px; border:1px solid var(--line); border-radius:6px; margin:6px 0 0; vertical-align:top; cursor:pointer; }
+  .imgbox { display:inline-block; text-align:center; margin:8px 10px 0 0; vertical-align:top; }
+  .btn2 { display:inline-block; margin:10px 8px 0 0; padding:8px 14px; background:var(--ac); color:#fff;
+    border:0; border-radius:8px; font:inherit; font-weight:600; cursor:pointer; text-decoration:none; }
+  .btn2.sec { background:#27334d; }
+  iframe { width:100%; height:520px; border:1px solid var(--line); border-radius:8px; margin-top:12px; background:#fff; }
+  .hint { color:var(--mut); font-size:12px; margin-top:6px; }
+  a.dl { color:var(--ac); }
+  .step-off { opacity:.5; pointer-events:none; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Fayda API Tester</h1>
+  <p class="sub">Gateway (send-otp / verify-otp) → Generator (decrypt → PDF / screenshot)</p>
+
+  <!-- Config -->
+  <div class="card">
+    <h2>⚙️ Config <span class="badge">saved in this browser</span></h2>
+    <div class="row">
+      <div><label>Gateway URL</label><input id="gwUrl" type="text" placeholder="https://your-gateway.up.railway.app" /></div>
+      <div><label>Generator URL</label><input id="genUrl" type="text" placeholder="https://your-contabo-host:8090" /></div>
+    </div>
+    <div class="row">
+      <div><label>Shared gateway key (x-api-key)</label>
+        <div class="keyrow"><input id="sharedKey" type="password" placeholder="gw_…" /><button type="button" class="eye" onclick="toggleKey('sharedKey', this)">show</button></div>
+      </div>
+      <div><label>Your generator key (x-api-key)</label>
+        <div class="keyrow"><input id="genKey" type="password" placeholder="rk_…" /><button type="button" class="eye" onclick="toggleKey('genKey', this)">show</button></div>
+      </div>
+    </div>
+    <button class="sec" onclick="saveCfg()">Save</button>
+    <button class="sec" onclick="health('gw')">Gateway health</button>
+    <button class="sec" onclick="health('gen')">Generator health</button>
+    <div id="cfgStatus" class="status"></div>
+  </div>
+
+  <!-- Step 1 -->
+  <div class="card" id="card1">
+    <h2>① Send OTP <span class="badge">gateway</span></h2>
+    <label>FAN / FIN (12–16 digits)</label>
+    <input id="fan" type="text" placeholder="6140798523697412" />
+    <button onclick="sendOtp()">Send OTP</button>
+    <div id="s1status" class="status"></div>
+    <pre id="s1out" hidden></pre>
+  </div>
+
+  <!-- Step 2 -->
+  <div class="card step-off" id="card2">
+    <h2>② Verify OTP <span class="badge">gateway</span></h2>
+    <div class="row">
+      <div><label>Session ID</label><input id="sid" type="text" placeholder="(from step 1)" /></div>
+      <div><label>OTP code</label><input id="otp" type="text" placeholder="123456" /></div>
+    </div>
+    <button onclick="verifyOtp()">Verify &amp; get encrypted payload</button>
+    <div id="s2status" class="status"></div>
+    <pre id="s2out" hidden></pre>
+  </div>
+
+  <!-- Step 3 -->
+  <div class="card step-off" id="card3">
+    <h2>③ Generate <span class="badge">generator</span></h2>
+    <label>Format</label>
+    <select id="format"><option value="pdf">PDF</option><option value="screenshot">Screenshot</option><option value="json">JSON (user data)</option></select>
+    <button onclick="generate()">Generate</button>
+    <div id="s3status" class="status"></div>
+    <div id="dl"></div>
+    <div id="imgs" class="imgs"></div>
+    <iframe id="pdfFrame" hidden></iframe>
+  </div>
+</div>
+
+<script>
+let encrypted = null;            // envelope from step 2
+const $ = (id) => document.getElementById(id);
+const cfg = () => ({
+  gwUrl: $("gwUrl").value.replace(/\/+$/,""),
+  genUrl: $("genUrl").value.replace(/\/+$/,""),
+  sharedKey: $("sharedKey").value.replace(/\s+/g, ""),   // strip ANY whitespace (incl. internal)
+  genKey: $("genKey").value.replace(/\s+/g, "")
+});
+
+// Toggle password visibility on a key input.
+function toggleKey(id, btn) {
+  const el = $(id);
+  const showing = el.type === "text";
+  el.type = showing ? "password" : "text";
+  btn.textContent = showing ? "show" : "hide";
+}
+
+// ── config persistence ──
+function saveCfg() {
+  localStorage.setItem("faydaTester", JSON.stringify(cfg()));
+  setStatus("cfgStatus", "Saved.", "ok");
+}
+// Editable defaults — pre-filled on first load, overridden by anything you Save.
+const DEFAULTS = {
+  gwUrl: "https://faydaapi-railways-production.up.railway.app",
+  genUrl: "https://vmi3085308.contaboserver.net/generator",
+  sharedKey: "gw_46bec4c4bd261e1151332146bd3336101660aa8a26366fd1",
+  genKey: ""
+};
+function loadCfg() {
+  let c = {};
+  try { c = JSON.parse(localStorage.getItem("faydaTester") || "{}"); } catch {}
+  $("gwUrl").value     = c.gwUrl     || DEFAULTS.gwUrl;
+  $("genUrl").value    = c.genUrl    || DEFAULTS.genUrl;
+  $("sharedKey").value = c.sharedKey || DEFAULTS.sharedKey;
+  $("genKey").value    = c.genKey    || DEFAULTS.genKey;
+}
+loadCfg();
+
+function setStatus(id, msg, kind) {
+  const el = $(id); el.textContent = msg; el.className = "status" + (kind ? " " + kind : "");
+}
+function show(id, data) { const el = $(id); el.hidden = false; el.textContent = typeof data === "string" ? data : JSON.stringify(data, null, 2); }
+function enable(cardId) { $(cardId).classList.remove("step-off"); }
+function b64ToBlobUrl(base64, type) {
+  const bin = atob(base64); const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return URL.createObjectURL(new Blob([bytes], { type: type || "application/octet-stream" }));
+}
+
+// ── health ──
+async function health(which) {
+  const c = cfg();
+  const base = which === "gw" ? c.gwUrl : c.genUrl;
+  if (!base) return setStatus("cfgStatus", "Set the URL first.", "err");
+  try {
+    const r = await fetch(base + "/api/health");
+    const j = await r.json();
+    setStatus("cfgStatus", (which==="gw"?"Gateway":"Generator")+": " + JSON.stringify(j), j.ok ? "ok" : "err");
+  } catch (e) { setStatus("cfgStatus", "Health failed: " + e.message, "err"); }
+}
+
+// ── step 1 ──
+async function sendOtp() {
+  const c = cfg();
+  if (!c.gwUrl || !c.sharedKey) return setStatus("s1status", "Set gateway URL + shared key.", "err");
+  setStatus("s1status", "Sending…");
+  try {
+    const r = await fetch(c.gwUrl + "/api/session", {
+      method:"POST", headers:{ "x-api-key":c.sharedKey, "Content-Type":"application/json" },
+      body: JSON.stringify({ individualId: $("fan").value.trim() })
+    });
+    const j = await r.json(); show("s1out", j);
+    if (!r.ok || !j.ok) return setStatus("s1status", "Error: " + (j.error || r.status), "err");
+    $("sid").value = j.sessionId;
+    setStatus("s1status", "OTP sent" + (j.maskedMobile ? " to " + j.maskedMobile : "") + ". Go to step 2.", "ok");
+    enable("card2");
+  } catch (e) { setStatus("s1status", "Request failed: " + e.message, "err"); }
+}
+
+// ── step 2 ──
+async function verifyOtp() {
+  const c = cfg();
+  const sid = $("sid").value.trim();
+  if (!sid) return setStatus("s2status", "Need a session id (run step 1).", "err");
+  setStatus("s2status", "Verifying…");
+  try {
+    const r = await fetch(c.gwUrl + "/api/session/" + encodeURIComponent(sid) + "/verify", {
+      method:"POST", headers:{ "x-api-key":c.sharedKey, "Content-Type":"application/json" },
+      body: JSON.stringify({ otp: $("otp").value.trim() })
+    });
+    const j = await r.json();
+    if (!r.ok || !j.ok) { show("s2out", j); return setStatus("s2status", "Error: " + (j.error || r.status), "err"); }
+    encrypted = j.encrypted;
+    show("s2out", { ok:true, fan:j.fan, encrypted:{ ...j.encrypted, d:(j.encrypted.d||"").slice(0,48)+"… ("+(j.encrypted.d||"").length+" chars)" } });
+    setStatus("s2status", "Encrypted payload received. Go to step 3.", "ok");
+    enable("card3");
+  } catch (e) { setStatus("s2status", "Request failed: " + e.message, "err"); }
+}
+
+// ── step 3 ──
+async function generate() {
+  const c = cfg();
+  if (!encrypted) return setStatus("s3status", "Run step 2 first.", "err");
+  if (!c.genUrl || !c.genKey) return setStatus("s3status", "Set generator URL + your key.", "err");
+  const format = $("format").value;
+  $("dl").innerHTML = ""; $("imgs").innerHTML = ""; $("pdfFrame").hidden = true;
+  setStatus("s3status", "Generating " + format + "…");
+  try {
+    const r = await fetch(c.genUrl + "/api/generate", {
+      method:"POST", headers:{ "x-api-key":c.genKey, "Content-Type":"application/json" },
+      body: JSON.stringify({ encrypted, format })
+    });
+    if (!r.ok) { let msg; try { msg = (await r.json()).error; } catch { msg = r.status; } return setStatus("s3status", "Error: " + msg, "err"); }
+
+    if (format === "pdf") {
+      const blob = await r.blob();
+      const url = URL.createObjectURL(blob);
+      const cd = r.headers.get("content-disposition") || "";
+      const name = decodeURIComponent(r.headers.get("X-Person-Name") || "")
+        || (cd.match(/filename="?([^"]+)"?/) || [])[1] || "fayda";
+      const counted = r.headers.get("X-Counted");
+      const used = r.headers.get("X-Usage-Total") || "?";
+      const fileName = name.endsWith(".pdf") ? name : name + ".pdf";
+      const dl = $("dl");
+      dl.innerHTML = "";
+      const title = document.createElement("div");
+      title.innerHTML = `<b>👤 ${name}</b> &nbsp; <span class="hint">used: ${used}${counted === "false" ? " · (repeat — not counted)" : ""}</span>`;
+      const aDl = document.createElement("a"); aDl.className = "btn2"; aDl.href = url; aDl.download = fileName; aDl.textContent = "⬇ Download PDF";
+      const bView = document.createElement("button"); bView.className = "btn2 sec"; bView.textContent = "👁 View in new tab"; bView.onclick = () => window.open(url, "_blank");
+      dl.append(title, aDl, bView);
+      $("pdfFrame").src = url; $("pdfFrame").hidden = false;
+      setStatus("s3status", "PDF ready for " + name + ".", "ok");
+    } else if (format === "json") {
+      const j = await r.json();
+      if (!j.ok) return setStatus("s3status", "Error: " + j.error, "err");
+      $("dl").innerHTML = `<div><b>👤 ${j.name || "result"}</b> <span class="hint">${j.counted === false ? "· (repeat — not counted)" : ""}</span></div>`;
+      $("imgs").innerHTML = "";
+      [["photo", j.photo], ["qr", j.qr], ["front", j.front], ["back", j.back]].forEach(([label, b64]) => {
+        if (!b64) return;
+        const src = String(b64).startsWith("data:") ? b64 : "data:image/png;base64," + b64;
+        const box = document.createElement("div"); box.className = "imgbox";
+        box.innerHTML = `<div class="hint">${label}</div>`;
+        const img = document.createElement("img"); img.src = src; img.alt = label; img.title = "click to view"; img.onclick = () => window.open(src, "_blank");
+        box.append(img);
+        $("imgs").append(box);
+      });
+      const pre = document.createElement("pre");
+      pre.style.cssText = "white-space:pre-wrap;word-break:break-word;max-height:340px;overflow:auto;background:#0d1117;color:#c9d1d9;padding:10px;border-radius:8px;font-size:12px;";
+      pre.textContent = JSON.stringify(j.data, null, 2);
+      const blob = new Blob([JSON.stringify(j, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const aDl = document.createElement("a"); aDl.className = "btn2"; aDl.href = url; aDl.download = (j.name || "fayda") + ".json"; aDl.textContent = "⬇ Download JSON";
+      $("dl").append(aDl, pre);
+      setStatus("s3status", "User data (JSON) for " + (j.name || "result") + ".", "ok");
+    } else {
+      const j = await r.json();
+      if (!j.ok) return setStatus("s3status", "Error: " + j.error, "err");
+      $("dl").innerHTML = `<div><b>👤 ${j.name || "result"}</b> <span class="hint">${j.counted === false ? "· (repeat — not counted)" : ""}</span></div>`;
+      $("imgs").innerHTML = "";
+      j.images.forEach(im => {
+        const url = b64ToBlobUrl(im.base64, im.contentType);
+        const box = document.createElement("div"); box.className = "imgbox";
+        box.innerHTML = `<div class="hint">${im.label}</div>`;
+        const img = document.createElement("img"); img.src = url; img.alt = im.label; img.title = "click to view full size"; img.onclick = () => window.open(url, "_blank");
+        const a = document.createElement("a"); a.className = "btn2"; a.href = url; a.download = im.filename || (j.name + "-" + im.label + ".png"); a.textContent = "⬇";
+        box.append(img, document.createElement("br"), a);
+        $("imgs").append(box);
+      });
+      setStatus("s3status", j.images.length + " image(s) for " + (j.name || "result") + ".", "ok");
+    }
+  } catch (e) { setStatus("s3status", "Request failed: " + e.message, "err"); }
+}
+</script>
+</body>
+</html>
