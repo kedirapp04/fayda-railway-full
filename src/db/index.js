@@ -63,7 +63,20 @@ async function init() {
 
     CREATE INDEX IF NOT EXISTS idx_usage_user_day ON usage_log(user_id, day);
     CREATE INDEX IF NOT EXISTS idx_keys_hash ON api_keys(key_hash);
+    CREATE INDEX IF NOT EXISTS idx_keys_user ON api_keys(user_id);
     CREATE INDEX IF NOT EXISTS idx_saves_user ON counter_saves(user_id);
+  `);
+
+  // Lock the public schema against Supabase's auto-exposed PostgREST API. With
+  // RLS enabled and NO policies, the anon/authenticated REST roles get zero
+  // access. The app connects as the `postgres` role (BYPASSRLS), so it is
+  // unaffected. ENABLE ROW LEVEL SECURITY is idempotent (no-op if already on).
+  await pool.query(`
+    ALTER TABLE users ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE api_keys ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE usage_log ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE counter_saves ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE settings ENABLE ROW LEVEL SECURITY;
   `);
 }
 
