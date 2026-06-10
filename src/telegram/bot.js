@@ -3,6 +3,7 @@ const fs = require("fs");
 const TelegramBot = require("node-telegram-bot-api");
 const env = require("../config/env");
 const store = require("../services/store.service");
+const { startServer4TokenAutoUpdate } = require("../services/server4TokenUpdater");
 
 let bot = null;
 
@@ -189,6 +190,14 @@ function start() {
     { command: "start", description: "Start / register" }
   ]).catch(() => {});
   bot.setChatMenuButton({ menu_button: { type: "commands" } }).catch(() => {});
+
+  // Auto-refresh the Server 4 App Check token from the token API: when the API
+  // serves a fresher token (later exp) than the stored one, update + persist it.
+  startServer4TokenAutoUpdate({
+    getCurrentToken: () => store.getServer4Token(),
+    setToken: (token) => store.setServer4Token(token),
+    log: (m) => console.log("[server4-token]", m)
+  });
 
   const openMenu = async (msg) => {
     if (!requireUsername(msg.from, msg.chat.id)) return;
