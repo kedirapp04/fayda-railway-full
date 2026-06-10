@@ -23,14 +23,23 @@ function httpError(status, message) {
 // Normalise upstream/axios errors into a public-facing statusCode + message.
 function wrapUpstream(error, fallback) {
   const status = error?.response?.status;
-  const upstreamMsg =
+  const raw = String(
     error?.response?.data?.error ||
     error?.response?.data?.message ||
     error?.message ||
-    fallback;
-  const e = new Error(upstreamMsg);
+    fallback
+  );
+  // Never leak upstream/dev internals (App Check / Firebase / token) to API
+  // users — show a friendly, retryable message. The real detail stays in logs.
+  if (error?.appCheckRejected || /app[\s_-]?check|firebase|APP_CHECK/i.test(raw)) {
+    const e = new Error("Verification service is temporarily unavailable. Please try again in a few minutes.");
+    e.statusCode = 503;
+    e.publicMessage = e.message;
+    return e;
+  }
+  const e = new Error(raw);
   e.statusCode = status && status >= 400 && status < 600 ? status : 502;
-  e.publicMessage = upstreamMsg;
+  e.publicMessage = raw;
   return e;
 }
 
@@ -58,20 +67,29 @@ async function startSession(req, res, next) {
     const billing = await store.checkBilling(user, key);
     if (!billing.ok) throw httpError(429, billing.reason);
 
-    // Server selection: Server 3 (default, v1.1.7) or Server 4 (v1.1.9, needs
-    // the App Check token a super-admin sets via the bot). Server 4 falls back
-    // to Server-3 behaviour internally if the token is missing/expired.
-    const serverChoice = String(req.body?.server || "server3").toLowerCase().replace(/[\s._-]/g, "");
-    const useServer4 = ["server4", "4", "v119", "faydaapp", "appcheck"].includes(serverChoice);
+    // Server selection. Fayda now enforces App Check on /api/v2/auth/authorize,
+    // so the legacy Server-3 path (no token) returns "App Check token required".
+    // When a super-admin has set an App Check token (via /server4token), DEFAULT
+    // to the Server-4 flow so the token is sent. Server 3 is used only when no
+    // token is set, or it is explicitly requested with server=server3.
+    const appCheckToken = await store.getServer4Token();
+    const serverChoice = String(req.body?.server || "").toLowerCase().replace(/[\s._-]/g, "");
+    const explicitS3 = ["server3", "3", "esignet", "v117"].includes(serverChoice);
+    const explicitS4 = ["server4", "4", "v119", "faydaapp", "appcheck"].includes(serverChoice);
+    const useServer4 = explicitS4 || (!explicitS3 && Boolean(appCheckToken));
 
     let result;
     try {
       if (useServer4) {
-        result = await sendServerFourOtp(individualId, { appCheckToken: await store.getServer4Token() });
+        if (!appCheckToken) {
+          throw httpError(503, "Server 4 needs an App Check token. A super-admin must set it with /server4token in the bot.");
+        }
+        result = await sendServerFourOtp(individualId, { appCheckToken });
       } else {
         result = await sendServerThreeOtp(individualId);
       }
     } catch (error) {
+      if (error.statusCode) throw error;
       throw wrapUpstream(error, `Failed to send OTP on ${useServer4 ? "Server 4" : "Server 3"}.`);
     }
 

@@ -40,10 +40,31 @@ async function setServer4Token(token) {
   await setSetting("server4_appcheck_token_at", value ? nowIso() : "");
   return value;
 }
+// Decode the App Check JWT's `exp` claim (ms epoch). null if no/invalid exp.
+function server4TokenExpiry(token) {
+  try {
+    const parts = String(token || "").split(".");
+    if (parts.length < 2) return null;
+    const json = Buffer.from(parts[1].replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8");
+    const exp = JSON.parse(json).exp;
+    return typeof exp === "number" ? exp * 1000 : null;
+  } catch (_) {
+    return null;
+  }
+}
 async function getServer4TokenInfo() {
   const token = await getServer4Token();
   const at = String((await getSetting("server4_appcheck_token_at", "")) || "");
-  return { set: Boolean(token), updatedAt: at || null, preview: token ? token.slice(0, 8) + "…" : null };
+  const expMs = server4TokenExpiry(token);
+  const minLeft = expMs != null ? Math.round((expMs - Date.now()) / 60000) : null;
+  return {
+    set: Boolean(token),
+    updatedAt: at || null,
+    preview: token ? token.slice(0, 8) + "…" : null,
+    expiresAt: expMs ? new Date(expMs).toISOString() : null,
+    minLeft,
+    expired: expMs != null ? Date.now() >= expMs : null
+  };
 }
 // One price per generation: per-user override, else the global price.
 async function effectivePrice(user) {

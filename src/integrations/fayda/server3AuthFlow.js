@@ -868,10 +868,27 @@ async function getServerFourAuthorizeUrl({ appCheckToken = null, debug = null } 
     }
     return { authorizeUrl, pkce, state, mode: "v119" };
   } catch (error) {
+    // If we DID send a token and Fayda still rejected it, that's a token problem
+    // (invalid/expired) — surface it directly. Don't mask it with the legacy
+    // (no-token) authorize, which Fayda now also gates behind App Check (it would
+    // turn a clear "invalid token" into a confusing "App Check token required").
+    if (tok) {
+      pushDebug(debug, {
+        type: "info",
+        label: "server4-authorize-token-rejected",
+        note: "v1.1.9 authorize rejected the supplied App Check token (likely expired/invalid) — refresh it",
+        error: error?.message || String(error)
+      });
+      const e = new Error("App Check token was rejected by Fayda (expired or invalid). Refresh the Server 4 token.");
+      e.response = error?.response;
+      e.appCheckRejected = true;
+      throw e;
+    }
+    // No token was supplied — fall back to the legacy Server-3 authorize.
     pushDebug(debug, {
       type: "info",
       label: "server4-authorize-fallback",
-      note: "v1.1.9 GET authorize failed (likely App Check enforced/expired); falling back to Server-3 authorize",
+      note: "No App Check token supplied; falling back to Server-3 authorize",
       error: error?.message || String(error)
     });
     const authorizeUrl = await getServerThreeAuthorizeUrl(debug);

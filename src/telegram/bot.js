@@ -7,6 +7,15 @@ const store = require("../services/store.service");
 let bot = null;
 
 const isAdmin = (tgId) => env.ADMIN_TELEGRAM_IDS.includes(String(tgId));
+
+// Server 4 App Check token status, from the decoded JWT `exp` (real expiry).
+function s4StatusLine(info) {
+  if (!info.set) return "❌ Empty (Server 4 falls back to Server 3)";
+  if (info.minLeft == null) return `✅ Set (${info.preview}) · no exp in token`;
+  return info.minLeft > 0
+    ? `✅ Set (${info.preview}) · expires in ${info.minLeft} min`
+    : `⚠️ EXPIRED ${Math.abs(info.minLeft)} min ago (${info.preview}) — refresh it`;
+}
 const TESTER_PATH = path.join(__dirname, "..", "..", "tester.html");
 const DOCS_PATH = path.join(__dirname, "..", "..", "userusage.md");
 
@@ -212,18 +221,14 @@ function start() {
     const token = (m[1] || "").trim();
     if (!token) {
       const info = await store.getServer4TokenInfo();
-      const ageMin = info.updatedAt ? Math.round((Date.now() - new Date(info.updatedAt).getTime()) / 60000) : null;
-      const status = info.set
-        ? `✅ Set (${info.preview})${ageMin != null ? ` · updated ${ageMin} min ago${ageMin > 55 ? " — ⚠️ likely expired, refresh it" : ""}` : ""}`
-        : "❌ Empty (Server 4 falls back to Server 3 behaviour)";
       return bot.sendMessage(msg.chat.id,
-        `🔑 Server 4 App Check token: ${status}\n\nTo update, send:\n\`/server4token <token>\`\n\nThe token is a device X-Firebase-AppCheck JWT, valid ~1 hour.`,
+        `🔑 Server 4 App Check token: ${s4StatusLine(info)}\n\nTo update, send:\n\`/server4token <token>\`\n\nThe token is a device X-Firebase-AppCheck JWT, valid ~1 hour.`,
         { parse_mode: "Markdown" });
     }
     await store.setServer4Token(token);
     // Remove the pasted token from the chat history for hygiene.
     bot.deleteMessage(msg.chat.id, msg.message_id).catch(() => {});
-    bot.sendMessage(msg.chat.id, `✅ Server 4 App Check token updated (${token.slice(0, 8)}…).\nValid ~1 hour — refresh when Server 4 downloads start failing.`);
+    bot.sendMessage(msg.chat.id, `✅ Server 4 App Check token updated.\n${s4StatusLine(await store.getServer4TokenInfo())}`);
   });
   bot.onText(/^\/price\s+(\d+)\s+([\d.]+|global)/i, async (msg, m) => {
     if (!isAdmin(msg.from.id)) return;
@@ -312,12 +317,8 @@ function start() {
         if (action === "s4token") {
           ack();
           const info = await store.getServer4TokenInfo();
-          const ageMin = info.updatedAt ? Math.round((Date.now() - new Date(info.updatedAt).getTime()) / 60000) : null;
-          const status = info.set
-            ? `✅ Set (${info.preview})${ageMin != null ? ` · updated ${ageMin} min ago${ageMin > 55 ? " — ⚠️ likely expired" : ""}` : ""}`
-            : "❌ Empty (Server 4 falls back to Server 3)";
           return edit(
-            `🔑 Server 4 App Check token\n${status}\n\nTo update, send a message:\n/server4token <token>\n\nDevice X-Firebase-AppCheck JWT, valid ~1 hour.`,
+            `🔑 Server 4 App Check token\n${s4StatusLine(info)}\n\nTo update, send a message:\n/server4token <token>\n\nDevice X-Firebase-AppCheck JWT, valid ~1 hour.`,
             { reply_markup: { inline_keyboard: [[{ text: "⬅ Panel", callback_data: "a:panel" }]] } }
           );
         }
