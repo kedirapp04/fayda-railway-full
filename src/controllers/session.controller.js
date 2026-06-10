@@ -1,5 +1,10 @@
 const env = require("../config/env");
-const { sendServerThreeOtp, authenticateServerThreeOtp } = require("../integrations/fayda/server3AuthFlow");
+const {
+  sendServerThreeOtp,
+  authenticateServerThreeOtp,
+  sendServerFourOtp,
+  authenticateServerFourOtp
+} = require("../integrations/fayda/server3AuthFlow");
 const { createSession, getSession, deleteSession } = require("../services/otpSession.service");
 const { maskFan } = require("../utils/crypto");
 const store = require("../services/store.service");
@@ -53,21 +58,33 @@ async function startSession(req, res, next) {
     const billing = await store.checkBilling(user, key);
     if (!billing.ok) throw httpError(429, billing.reason);
 
+    // Server selection: Server 3 (default, v1.1.7) or Server 4 (v1.1.9, needs
+    // the App Check token a super-admin sets via the bot). Server 4 falls back
+    // to Server-3 behaviour internally if the token is missing/expired.
+    const serverChoice = String(req.body?.server || "server3").toLowerCase().replace(/[\s._-]/g, "");
+    const useServer4 = ["server4", "4", "v119", "faydaapp", "appcheck"].includes(serverChoice);
+
     let result;
     try {
-      result = await sendServerThreeOtp(individualId);
+      if (useServer4) {
+        result = await sendServerFourOtp(individualId, { appCheckToken: await store.getServer4Token() });
+      } else {
+        result = await sendServerThreeOtp(individualId);
+      }
     } catch (error) {
-      throw wrapUpstream(error, "Failed to send OTP on Server 3.");
+      throw wrapUpstream(error, `Failed to send OTP on ${useServer4 ? "Server 4" : "Server 3"}.`);
     }
 
     const sessionId = createSession({
       individualId,
-      authSession: result.serverThreeAuthSession
+      server: useServer4 ? "server4" : "server3",
+      authSession: useServer4 ? result.serverFourAuthSession : result.serverThreeAuthSession
     });
 
     res.json({
       ok: true,
       sessionId,
+      server: useServer4 ? "server4" : "server3",
       fan: maskFan(individualId),
       maskedMobile: result.maskedMobile || null,
       maskedEmail: result.maskedEmail || null,
@@ -104,17 +121,25 @@ async function verifyAndGenerate(req, res, next) {
     const billing = await store.checkBilling(user, key);
     if (!billing.ok) throw httpError(429, billing.reason);
 
+    const isServer4 = session.server === "server4";
     let verifyResponse;
     try {
-      verifyResponse = await authenticateServerThreeOtp({
-        otp,
-        individualId: session.individualId,
-        authSession: session.authSession
-      });
+      verifyResponse = isServer4
+        ? await authenticateServerFourOtp({
+            otp,
+            individualId: session.individualId,
+            authSession: session.authSession,
+            appCheckToken: await store.getServer4Token()
+          })
+        : await authenticateServerThreeOtp({
+            otp,
+            individualId: session.individualId,
+            authSession: session.authSession
+          });
     } catch (error) {
-      // OTP is single-use on Server 3 — drop the session so the caller restarts.
+      // OTP is single-use on the eSignet flow — drop the session so the caller restarts.
       deleteSession(sessionId);
-      throw wrapUpstream(error, "Failed to verify OTP on Server 3.");
+      throw wrapUpstream(error, `Failed to verify OTP on ${isServer4 ? "Server 4" : "Server 3"}.`);
     }
 
     deleteSession(sessionId);

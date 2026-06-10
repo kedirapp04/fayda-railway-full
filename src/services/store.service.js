@@ -27,6 +27,24 @@ async function setGlobalPrice(p) {
   await setSetting("global_price", Math.max(0, Number(p) || 0));
   return globalPrice();
 }
+
+// ─── Server 4 (Fayda app v1.1.9) App Check token ───────────────────────────
+// Short-lived (~1h) device X-Firebase-AppCheck token. A super-admin refreshes
+// it via the Telegram bot (/server4token <token>); the API reads it per-call.
+async function getServer4Token() {
+  return String((await getSetting("server4_appcheck_token", "")) || "").trim();
+}
+async function setServer4Token(token) {
+  const value = String(token || "").trim();
+  await setSetting("server4_appcheck_token", value);
+  await setSetting("server4_appcheck_token_at", value ? nowIso() : "");
+  return value;
+}
+async function getServer4TokenInfo() {
+  const token = await getServer4Token();
+  const at = String((await getSetting("server4_appcheck_token_at", "")) || "");
+  return { set: Boolean(token), updatedAt: at || null, preview: token ? token.slice(0, 8) + "…" : null };
+}
 // One price per generation: per-user override, else the global price.
 async function effectivePrice(user) {
   if (user && user.price_override != null) return Number(user.price_override);
@@ -310,6 +328,9 @@ module.exports = {
   globalPrice,
   setGlobalPrice,
   effectivePrice,
+  getServer4Token,
+  setServer4Token,
+  getServer4TokenInfo,
   setBillingMode,
   topUp,
   setPrice,

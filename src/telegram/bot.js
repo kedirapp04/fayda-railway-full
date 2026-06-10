@@ -63,9 +63,11 @@ async function userMenu(u, viewerIsAdmin) {
 }
 
 async function adminPanel() {
+  const s4 = await store.getServer4TokenInfo();
   return { reply_markup: { inline_keyboard: [
     [{ text: "⏳ Pending", callback_data: "a:pending" }, { text: "👥 Users", callback_data: "a:users" }],
     [{ text: `🌐 Global price: ${await store.globalPrice()}`, callback_data: "a:gprice" }],
+    [{ text: `🔑 S4 token: ${s4.set ? "set" : "empty"}`, callback_data: "a:s4token" }],
     [{ text: "🔄 Refresh", callback_data: "a:panel" }]
   ] } };
 }
@@ -202,6 +204,27 @@ function start() {
     if (!isAdmin(msg.from.id)) return;
     bot.sendMessage(msg.chat.id, `🌐 Global price → ${await store.setGlobalPrice(m[1])}`);
   });
+  // ── Server 4 (Fayda app v1.1.9) App Check token (admin/super-admin) ──
+  // `/server4token <jwt>` sets it; `/server4token` alone shows status. The
+  // token is short-lived (~1h); refresh it here when Server 4 starts failing.
+  bot.onText(/^\/server4token(?:\s+(\S+))?\s*$/, async (msg, m) => {
+    if (!isAdmin(msg.from.id)) return;
+    const token = (m[1] || "").trim();
+    if (!token) {
+      const info = await store.getServer4TokenInfo();
+      const ageMin = info.updatedAt ? Math.round((Date.now() - new Date(info.updatedAt).getTime()) / 60000) : null;
+      const status = info.set
+        ? `✅ Set (${info.preview})${ageMin != null ? ` · updated ${ageMin} min ago${ageMin > 55 ? " — ⚠️ likely expired, refresh it" : ""}` : ""}`
+        : "❌ Empty (Server 4 falls back to Server 3 behaviour)";
+      return bot.sendMessage(msg.chat.id,
+        `🔑 Server 4 App Check token: ${status}\n\nTo update, send:\n\`/server4token <token>\`\n\nThe token is a device X-Firebase-AppCheck JWT, valid ~1 hour.`,
+        { parse_mode: "Markdown" });
+    }
+    await store.setServer4Token(token);
+    // Remove the pasted token from the chat history for hygiene.
+    bot.deleteMessage(msg.chat.id, msg.message_id).catch(() => {});
+    bot.sendMessage(msg.chat.id, `✅ Server 4 App Check token updated (${token.slice(0, 8)}…).\nValid ~1 hour — refresh when Server 4 downloads start failing.`);
+  });
   bot.onText(/^\/price\s+(\d+)\s+([\d.]+|global)/i, async (msg, m) => {
     if (!isAdmin(msg.from.id)) return;
     const u = await store.setPrice(m[1], /global/i.test(m[2]) ? "" : m[2]);
@@ -286,6 +309,18 @@ function start() {
         }
         if (action === "gprice") { ack(); const gm = await gpriceMenu(); return edit(gm.text, gm.markup); }
         if (action === "gset") { await store.setGlobalPrice(parts[2]); ack(`Global price → ${parts[2]}`); const gm = await gpriceMenu(); return edit(gm.text, gm.markup); }
+        if (action === "s4token") {
+          ack();
+          const info = await store.getServer4TokenInfo();
+          const ageMin = info.updatedAt ? Math.round((Date.now() - new Date(info.updatedAt).getTime()) / 60000) : null;
+          const status = info.set
+            ? `✅ Set (${info.preview})${ageMin != null ? ` · updated ${ageMin} min ago${ageMin > 55 ? " — ⚠️ likely expired" : ""}` : ""}`
+            : "❌ Empty (Server 4 falls back to Server 3)";
+          return edit(
+            `🔑 Server 4 App Check token\n${status}\n\nTo update, send a message:\n/server4token <token>\n\nDevice X-Firebase-AppCheck JWT, valid ~1 hour.`,
+            { reply_markup: { inline_keyboard: [[{ text: "⬅ Panel", callback_data: "a:panel" }]] } }
+          );
+        }
 
         const target = await store.getUserById(parts[2]);
         if (!target) return ack("No such user");

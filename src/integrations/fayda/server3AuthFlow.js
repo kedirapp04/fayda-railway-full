@@ -398,6 +398,26 @@ function hashOauthDetails(oauthDetails) {
   return base64Url(digest);
 }
 
+// --- Server 4 (Fayda app v1.1.9) helpers -------------------------------------
+// v1.1.9 differs from Server 3 in two ways only: (1) Phase 1 (authorize) and
+// Phase 3 (callback) carry an X-Firebase-AppCheck token, and (2) Phase 1 sends
+// a client-generated PKCE codeChallenge so Phase 3 can POST { code, codeVerifier,
+// state } to the callback. The eSignet middle (csrf -> oauth-details -> send-otp
+// -> authenticate -> auth-code) is identical and reused verbatim.
+function generatePkce() {
+  const codeVerifier = base64Url(crypto.randomBytes(96));
+  const codeChallenge = base64Url(crypto.createHash("sha256").update(codeVerifier).digest());
+  return { codeVerifier, codeChallenge, codeChallengeMethod: "S256" };
+}
+
+function randomState() {
+  return `${base64Url(crypto.randomBytes(18))}.${base64Url(crypto.randomBytes(6))}`;
+}
+
+function resolveServer4AppCheck(appCheckToken) {
+  return String(appCheckToken || process.env.SERVER4_APPCHECK_TOKEN || "").trim();
+}
+
 function getXsrfToken(jar, csrfResponseData) {
   return (
     jar.get("XSRF-TOKEN") ||
@@ -582,7 +602,10 @@ async function sendServerThreeOtp(individualId, options = {}) {
   };
 }
 
-async function authenticateServerThreeOtp({ otp, individualId, authSession, debug = null }) {
+// Shared eSignet authenticate + auth-code step (identical for Server 3 and 4).
+// Returns the auth-code payload (with the authorization `code`) plus the
+// authenticate payload (for consentAction). Phase 3 (callback) is server-specific.
+async function runEsignetAuthenticate({ otp, individualId, authSession, debug = null }) {
   if (!authSession?.transactionId) {
     throw new Error("Missing eSignet auth session. Resend OTP and try again.");
   }
@@ -676,6 +699,11 @@ async function authenticateServerThreeOtp({ otp, individualId, authSession, debu
     throw new Error("eSignet did not return an authorization code.");
   }
 
+  return { codePayload, authPayload };
+}
+
+async function authenticateServerThreeOtp({ otp, individualId, authSession, debug = null }) {
+  const { codePayload, authPayload } = await runEsignetAuthenticate({ otp, individualId, authSession, debug });
   const callbackResponse = await exchangeServerThreeAuthorizationCode(codePayload.code, debug);
   return {
     ...callbackResponse,
@@ -787,10 +815,201 @@ async function exchangeServerThreeAuthorizationCode(code, debug = null) {
 
   throw lastError || new Error("Fayda callback exchange failed.");
 }
+// --- Server 4 (Fayda app v1.1.9): Phase 1 authorize + Phase 3 callback --------
+
+// Phase 1 (v1.1.9): client generates PKCE + state, then
+//   GET /api/v2/auth/authorize?codeChallenge=<S256>&state=<random>
+//   headers: x-firebase-appcheck: <device token>
+// -> returns the eSignet /authorize?client_id=... link. We then rewrite that
+// link's code_challenge / code_challenge_method / state to OUR generated values
+// so oauth-details (which reads them off the URL) matches OUR verifier at the
+// Phase 3 callback. If App Check is missing/invalid the GET 401s, so we fall
+// back to the Server-3 legacy authorize (backend PKCE, legacy ?code= callback).
+async function getServerFourAuthorizeUrl({ appCheckToken = null, debug = null } = {}) {
+  const config = getConfig();
+  const pkce = generatePkce();
+  const state = randomState();
+  const url =
+    config.faydaApiBase +
+    "/api/v2/auth/authorize" +
+    `?codeChallenge=${encodeURIComponent(pkce.codeChallenge)}` +
+    `&state=${encodeURIComponent(state)}`;
+
+  const headers = buildBackendHeaders(
+    config.backendUseApiKey === "never" ? null : config.apiKey,
+    config.minimalBackendHeaders
+  );
+  const tok = resolveServer4AppCheck(appCheckToken);
+  if (tok) headers["X-Firebase-AppCheck"] = tok;
+
+  try {
+    pushDebug(debug, {
+      type: "request",
+      label: "server4-authorize-v119",
+      request: { method: "GET", url, headers, data: null }
+    });
+    const response = await backendNativeRequest("GET", url, { headers, timeoutMs: config.timeoutMs });
+    pushDebug(debug, {
+      type: "response",
+      label: "server4-authorize-v119",
+      response: { status: response.status, statusText: response.statusText, headers: response.headers || {}, data: response.data }
+    });
+
+    let authorizeUrl = rewriteAuthorizeUrl(extractAuthorizeUrl(response.data), debug);
+    // Force OUR PKCE challenge + state onto the returned link (mirrors bothfile.js).
+    try {
+      const parsed = new URL(authorizeUrl);
+      parsed.searchParams.set("code_challenge", pkce.codeChallenge);
+      parsed.searchParams.set("code_challenge_method", "S256");
+      parsed.searchParams.set("state", state);
+      authorizeUrl = parsed.toString();
+    } catch (_) {
+      // keep the raw URL if it is not parseable
+    }
+    return { authorizeUrl, pkce, state, mode: "v119" };
+  } catch (error) {
+    pushDebug(debug, {
+      type: "info",
+      label: "server4-authorize-fallback",
+      note: "v1.1.9 GET authorize failed (likely App Check enforced/expired); falling back to Server-3 authorize",
+      error: error?.message || String(error)
+    });
+    const authorizeUrl = await getServerThreeAuthorizeUrl(debug);
+    return { authorizeUrl, pkce: null, state: null, mode: "legacy" };
+  }
+}
+
+// Phase 3 (v1.1.9): POST /api/v2/auth/callback  body { code, codeVerifier, state }
+// headers: x-firebase-appcheck: <device token>. Returns the raw callback JSON
+// (same { accessToken, userData, ... } shape the PDF pipeline consumes).
+async function exchangeServerFourCallback({ code, codeVerifier = null, state = null, appCheckToken = null, debug = null }) {
+  if (!code) throw new Error("Missing authorization code for Server 4 callback.");
+  const config = getConfig();
+  const url = config.faydaApiBase + "/api/v2/auth/callback";
+  const headers = buildBackendHeaders(
+    config.backendUseApiKey === "never" ? null : config.apiKey,
+    config.minimalBackendHeaders
+  );
+  const tok = resolveServer4AppCheck(appCheckToken);
+  if (tok) headers["X-Firebase-AppCheck"] = tok;
+
+  const body = JSON.stringify({ code, codeVerifier, state });
+  pushDebug(debug, {
+    type: "request",
+    label: "server4-callback-body",
+    request: { method: "POST", url, headers, data: { code, codeVerifier, state } }
+  });
+  try {
+    const response = await backendNativeRequest("POST", url, { headers, body, timeoutMs: config.timeoutMs });
+    pushDebug(debug, {
+      type: "response",
+      label: "server4-callback-body",
+      response: { status: response.status, statusText: response.statusText, headers: response.headers || {}, data: response.data }
+    });
+    return response.data;
+  } catch (error) {
+    pushDebug(debug, {
+      type: "error",
+      label: "server4-callback-body",
+      error: {
+        message: error?.message || String(error),
+        code: error?.code || null,
+        response: error?.response
+          ? { status: error.response.status, statusText: error.response.statusText, headers: error.response.headers || {}, data: error.response.data }
+          : null
+      }
+    });
+    throw error;
+  }
+}
+
+async function sendServerFourOtp(individualId, options = {}) {
+  const debug = options.debug || options.debugEvents || null;
+  const appCheckToken = options.appCheckToken || null;
+  const config = getConfig();
+
+  const authorize = await getServerFourAuthorizeUrl({ appCheckToken, debug });
+  const session = await initializeServerThreeSession(authorize.authorizeUrl, debug);
+  // Carry the v1.1.9 PKCE + state + token through to the Phase 3 callback.
+  session.pkce = authorize.pkce || null;
+  session.callbackState = authorize.state || null;
+  session.callbackMode = authorize.mode === "v119" ? "body" : "legacy";
+  session.appCheckToken = appCheckToken || null;
+
+  const jar = new CookieJar(session.cookies);
+  const client = axios.create({
+    baseURL: config.esignetBase,
+    timeout: config.timeoutMs,
+    validateStatus: (status) => status >= 200 && status < 500
+  });
+
+  const response = await requestWithCookies(client, jar, {
+    method: "POST",
+    url: "/v1/esignet/authorization/send-otp",
+    headers: buildEsignetHeaders(session),
+    data: {
+      requestTime: new Date().toISOString(),
+      request: {
+        transactionId: session.transactionId,
+        individualId,
+        otpChannels: config.otpChannels,
+        captchaToken: null
+      }
+    }
+  }, debug, "esignet-send-otp");
+  throwIfEsignetErrors(response.data, "Failed to send eSignet OTP.");
+
+  session.cookies = jar.toJSON();
+  const maskedMobile = response.data?.response?.maskedMobile || null;
+  const maskedEmail = response.data?.response?.maskedEmail || null;
+  return {
+    transactionId: session.transactionId,
+    serverFourAuthSession: session,
+    sendOtpResponse: response.data,
+    maskedMobile,
+    maskedEmail
+  };
+}
+
+async function authenticateServerFourOtp({ otp, individualId, authSession, appCheckToken = null, debug = null }) {
+  const { codePayload, authPayload } = await runEsignetAuthenticate({ otp, individualId, authSession, debug });
+
+  const useBodyCallback = authSession.callbackMode !== "legacy" && authSession.pkce;
+  const token = appCheckToken || authSession.appCheckToken || null;
+
+  let callbackResponse;
+  if (useBodyCallback) {
+    callbackResponse = await exchangeServerFourCallback({
+      code: codePayload.code,
+      codeVerifier: authSession.pkce.codeVerifier,
+      state: codePayload.state || authSession.callbackState || null,
+      appCheckToken: token,
+      debug
+    });
+  } else {
+    // legacy fallback: Server-3 ?code= callback (backend-held PKCE)
+    callbackResponse = await exchangeServerThreeAuthorizationCode(codePayload.code, debug);
+  }
+
+  return {
+    ...callbackResponse,
+    serverFour: {
+      transactionId: authSession.transactionId,
+      consentAction: authPayload?.consentAction || null,
+      state: codePayload?.state || null,
+      redirectUri: codePayload?.redirectUri || null,
+      callbackMode: useBodyCallback ? "body" : "legacy"
+    }
+  };
+}
+
 module.exports = {
   sendServerThreeOtp,
   authenticateServerThreeOtp,
-  exchangeServerThreeAuthorizationCode
+  exchangeServerThreeAuthorizationCode,
+  sendServerFourOtp,
+  authenticateServerFourOtp,
+  exchangeServerFourCallback
 };
 
 
