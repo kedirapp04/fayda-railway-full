@@ -9,17 +9,38 @@
 const http = require("http");
 const https = require("https");
 
-const DEFAULT_API_URL = "http://57.131.35.207:8000/api/token";
+const DEFAULT_API_URL = "http://173.249.21.62:8010/token";
 
-function fetchJson(url, timeoutMs = 15000) {
+// The token API requires an X-CSRF-Token header on /token (HTTP 401 without it).
+// Each approved Telegram user gets theirs from the bot's /csrf command; put it in
+// the .env so this service can read /token. See API_USAGE.md.
+function csrfHeader(explicit) {
+  const token = String(
+    explicit || process.env.SERVER4_TOKEN_API_CSRF || process.env.XCSRF_TOKEN || ""
+  ).trim();
+  return token ? { "X-CSRF-Token": token } : {};
+}
+
+// fetchJson(url) — auto-attaches the X-CSRF-Token from env. Back-compatible 2nd
+// arg: a number = timeoutMs (legacy), or { timeoutMs, csrfToken, headers }.
+function fetchJson(url, opts = {}) {
+  const timeoutMs = typeof opts === "number" ? opts : (opts.timeoutMs || 15000);
+  const headers = {
+    Accept: "application/json",
+    ...csrfHeader(typeof opts === "object" ? opts.csrfToken : undefined),
+    ...(typeof opts === "object" && opts.headers ? opts.headers : {})
+  };
   return new Promise((resolve, reject) => {
     const lib = String(url).startsWith("https") ? https : http;
-    const req = lib.get(url, { timeout: timeoutMs }, (res) => {
+    const req = lib.get(url, { timeout: timeoutMs, headers }, (res) => {
       let body = "";
       res.on("data", (c) => (body += c));
       res.on("end", () => {
         if (!res.statusCode || res.statusCode < 200 || res.statusCode >= 300) {
-          return reject(new Error("HTTP " + res.statusCode));
+          const hint = res.statusCode === 401
+            ? " (missing/invalid X-CSRF-Token — set SERVER4_TOKEN_API_CSRF in .env)"
+            : "";
+          return reject(new Error("HTTP " + res.statusCode + hint));
         }
         try { resolve(JSON.parse(body)); } catch (e) { reject(e); }
       });
@@ -64,7 +85,10 @@ function startServer4TokenAutoUpdate({ getCurrentToken, setToken, apiUrl, interv
     if (stopped) return;
     try {
       const data = await fetchJson(url);
-      const fetched = String((data && (data.value || data.token)) || "").trim();
+      // Honor the API's lifecycle status — never adopt an expired/none token.
+      const status = data && data.status ? String(data.status).toLowerCase() : "";
+      const usable = !status || status === "active" || status === "warning";
+      const fetched = usable ? String((data && (data.token || data.value)) || "").trim() : "";
       if (fetched) {
         const current = String((await getCurrentToken()) || "").trim();
         const fetchedExp = tokenExp(fetched);
