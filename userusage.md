@@ -1,12 +1,12 @@
 # Developer Usage Guide
 
 Integrate the Fayda API: go from a 12–16 digit FAN/FIN to a finished **PDF**,
-**screenshot**, or raw **JSON** user data in **two calls** against **one
-service** with **one key**.
+**screenshot**, raw **JSON** user data, or **PDF + JSON together** in **two
+calls** against **one service** with **one key**.
 
 ```
- 1. POST  {BASE}/api/session            → sessionId                 (your key)
- 2. POST  {BASE}/api/session/:id/verify → PDF / screenshot / json   (your key)
+ 1. POST  {BASE}/api/session            → sessionId                          (your key)
+ 2. POST  {BASE}/api/session/:id/verify → PDF / screenshot / json / pdf_json (your key)
 ```
 
 The OTP is verified and the document is rendered **in the same request** — there
@@ -35,8 +35,9 @@ BASE = https://<your-app>.up.railway.app
 ```
 
 > **Counting:** each *successful* verify counts once. One OTP verification → one
-> render. To get another format (e.g. a PDF **and** the JSON), send a **fresh
-> OTP** and verify again with that format.
+> render. To get a PDF **and** the JSON from a single OTP, use
+> `format: "pdf_json"` (counts once). Other format combinations still need a
+> **fresh OTP** per format.
 
 ---
 
@@ -50,10 +51,14 @@ curl -X POST "$BASE/api/session" \
 ```
 ```json
 { "ok": true, "sessionId": "sess_ab12…", "fan": "************7412",
-  "maskedMobile": "******1234", "maskedEmail": null, "channels": ["email","phone"] }
+  "maskedMobile": "#####1234", "maskedEmail": null, "channels": ["email","phone"] }
 ```
 `individualId` = 12–16 digit FAN/FIN. Keep the `sessionId` for step 2
 (valid ~10 min).
+
+> **`maskedMobile`** masks an Ethiopian (`+251`) mobile and reveals only the last
+> 4 digits — so `#####1234` is really `+251*****1234`. If you show it to your
+> users, display it in the `+251*****1234` form.
 
 ## 2. Verify OTP & render
 
@@ -69,12 +74,17 @@ curl -X POST "$BASE/api/session/sess_ab12…/verify" \
 curl -X POST "$BASE/api/session/sess_ab12…/verify" \
   -H "x-api-key: $KEY" -H "Content-Type: application/json" \
   -d '{ "otp": "123456", "format": "json" }'
+
+# PDF + JSON together in one request (counts once):
+curl -X POST "$BASE/api/session/sess_ab12…/verify" \
+  -H "x-api-key: $KEY" -H "Content-Type: application/json" \
+  -d '{ "otp": "123456", "format": "pdf_json" }'
 ```
 OTP is single-use. On a wrong OTP the session is dropped — restart at step 1.
 
 - `format: "pdf"` (default) → `application/pdf` bytes. Response headers:
   - `Content-Disposition: attachment; filename="<Full Name>.pdf"` — **the file
-    is named after the person** (e.g. `Kedir Seid Aman.pdf`), falling back to the
+    is named after the person** (e.g. `Abebe Kebede Tadesse.pdf`), falling back to the
     FAN then `fayda`.
   - `X-Person-Name` — the person's full name (URL-encoded), so you can name the
     file even when reading the body as a stream.
@@ -82,7 +92,7 @@ OTP is single-use. On a wrong OTP the session is dropped — restart at step 1.
   - (These custom headers are exposed via `Access-Control-Expose-Headers`.)
 - `format: "screenshot"` → JSON, including the person's **name**:
   ```json
-  { "ok": true, "format": "screenshot", "name": "Kedir Seid Aman",
+  { "ok": true, "format": "screenshot", "name": "Abebe Kebede Tadesse",
     "images": [ { "label":"front", "filename":"front-Kedir_Seid_Aman.png",
                   "contentType":"image/png", "base64":"…" }, … ] }
   ```
@@ -94,7 +104,7 @@ OTP is single-use. On a wrong OTP the session is dropped — restart at step 1.
   `locked`, …) — with only the bulky base64 image blobs stripped out and
   surfaced separately as `photo` / `qr` / `front` / `back`:
   ```json
-  { "ok": true, "format": "json", "name": "Kedir Seid Aman",
+  { "ok": true, "format": "json", "name": "Abebe Kebede Tadesse",
     "data": { "fullName_eng":"…", "fullName_amh":"…", "dateOfBirth_eng":"…",
               "gender_eng":"…", "citizenship_Eng":"…", "phone":"…",
               "region_eng":"…", "zone_eng":"…", "woreda_eng":"…", "fcn":"…",
@@ -103,6 +113,18 @@ OTP is single-use. On a wrong OTP the session is dropped — restart at step 1.
     "photo":"<base64>", "qr":"<base64>", "front":"<base64>", "back":"<base64>" }
   ```
   Image fields are `null` when the source ID didn't include them.
+- `format: "pdf_json"` → **everything in the `json` response above**, plus a
+  rendered PDF as base64 — so one OTP verification returns both the id-data and
+  the document (and still **counts once**). Aliases: `json_pdf`, `pdfjson`,
+  `both`, `all`.
+  ```json
+  { "ok": true, "format": "pdf_json", "name": "Abebe Kebede Tadesse",
+    "data": { … same fields as `json` … },
+    "photo":"<base64>", "qr":"<base64>", "front":"<base64>", "back":"<base64>",
+    "pdf": { "filename":"Abebe Kebede Tadesse.pdf", "contentType":"application/pdf",
+             "base64":"<base64-pdf>" } }
+  ```
+  Decode `pdf.base64` to bytes and write it to a `.pdf` file.
 
 ---
 
@@ -197,11 +219,21 @@ Your account runs in one of three **billing modes** (set by an admin):
 - The per-generation **price** is a global default the admin can override per
   account.
 - Check yours: bot → **📊 My Usage** (mode, balance/owed, price, count). Daily
-  counters reset at 00:00 UTC; balance top-ups and limit raises need an admin.
+  counters reset at 00:00 UTC; limit raises need an admin.
+
+### Debt & paying
+
+- Your **debt** = this period's generations × the current price + any unpaid
+  saved payments. It's shown on the menu, **📊 My Usage**, and **💳 Pay Debt**.
+- **💵 Add Balance** notifies an admin to credit your balance.
+- **💳 Pay Debt** lists your unpaid payments — tap **Pay All** or a single one,
+  then **send your receipt** (transaction text, photo, or PDF). An admin reviews
+  it and **Approves** (marks it paid) or **Rejects** (resend a valid receipt).
+  _(Direct CBE self-service payment is coming.)_
 
 ## Tips
 
-- One OTP verification → one rendered output. For a PDF **and** the JSON of the
-  same person, run send-OTP + verify twice (once per format). Each counts once.
+- One OTP verification → one rendered output. To get a PDF **and** the JSON of
+  the same person in a single verify, use `format: "pdf_json"` (counts once).
 - Keep your key secret. Leaked? Bot → **🗑 Revoke & Replace** (deletes the old
   key, issues a fresh one, keeps your usage count).

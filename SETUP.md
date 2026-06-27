@@ -13,16 +13,25 @@ is **no internal `/generate` call and no RSA/AES envelope**. Storage is
   `sessionId` (+ masked phone/email). Billing/limits are pre-checked so an OTP is
   never sent to a user who can't spend it.
 - **`POST /api/session/:id/verify`** `{ otp, format }` → verifies the OTP and
-  renders **in the same process**. `format` ∈ `pdf` | `screenshot` | `json`.
-  One render per verify; the session is then consumed.
+  renders **in the same process**. `format` ∈ `pdf` | `screenshot` | `json` | `pdf_json`.
+  One render per verify; the session is then consumed (charged once).
   - `pdf` → `application/pdf` bytes (rendered to a Buffer, never touches disk).
   - `screenshot` → JSON with base64 images (in memory).
   - `json` → decoded ID fields + photo/qr/front/back.
+  - `pdf_json` → the `json` payload **plus** a `pdf` object
+    `{ filename, contentType, base64 }` — both id-data and the rendered PDF in
+    one response. Aliases: `json_pdf`, `pdfjson`, `both`, `all`.
 - Billing modes per user: **counter** (daily/total limits), **prepaid**
   (balance), **postpaid** (owed vs credit limit). Charged once per successful
-  verify.
+  verify. Each user has a **debt** = current period × price + unpaid saved
+  payments; "Save & reset" freezes a period into a paid/unpaid payment record.
 - **Telegram admin bot** (polling) manages users: approve, issue/revoke keys,
-  limits, billing, counter save & reset, free tester key.
+  limits, billing (price / postpaid limit / add balance — manual entry),
+  save & reset, **mark payments paid**, free tester key. Destructive actions
+  confirm first.
+- **Payments:** users **Add Balance** (notifies admin) or **Pay Debt** (all or a
+  single unpaid payment) by sending a **receipt** (text / photo / PDF); an admin
+  **Approves** (marks paid) or **Rejects**. Direct CBE self-service is planned.
 
 ## 1. Supabase
 Create a project → Settings → Database → Connection string → **Session pooler**

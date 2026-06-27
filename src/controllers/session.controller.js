@@ -11,7 +11,20 @@ const store = require("../services/store.service");
 const { generateDigitalIdPdf, sanitizeVerifyResponse } = require("../integrations/fayda/pdfGenerator");
 const { buildServerOneScreenshotAssets } = require("../integrations/fayda/screenshotGenerator");
 
-const FORMATS = ["pdf", "screenshot", "json"];
+const FORMATS = ["pdf", "screenshot", "json", "pdf_json"];
+// Friendly aliases for the combined PDF+JSON format → canonical "pdf_json".
+const FORMAT_ALIASES = {
+  json_pdf: "pdf_json",
+  jsonpdf: "pdf_json",
+  pdfjson: "pdf_json",
+  "pdf+json": "pdf_json",
+  "json+pdf": "pdf_json",
+  both: "pdf_json",
+  all: "pdf_json"
+};
+
+// Image keys live in their own response fields; everything else goes under `data`.
+const JSON_IMG_KEYS = ["photo", "QRCodes", "qrCodes", "qrCode", "fronts", "front", "backs", "back"];
 
 function httpError(status, message) {
   const err = new Error(message);
@@ -50,6 +63,24 @@ function safeFilename(value, fallback) {
     .replace(/\s+/g, " ")
     .trim();
   return cleaned || fallback || "fayda";
+}
+
+// Build the decoded-fields JSON payload. Shared by the `json` and `pdf_json`
+// formats so both return the exact same id-data shape ("current style").
+function buildJsonPayload(cleanResponse, pdfData, fallbackName) {
+  const raw = cleanResponse?.user?.data || cleanResponse?.data || {};
+  const data = {};
+  for (const [k, v] of Object.entries(raw)) {
+    if (!JSON_IMG_KEYS.includes(k)) data[k] = v;
+  }
+  return {
+    name: safeFilename(pdfData.fullName_eng, fallbackName),
+    data,
+    photo: pdfData.photo || null,
+    qr: pdfData.QRCodes || null,
+    front: pdfData.fronts || null,
+    back: pdfData.backs || null
+  };
 }
 
 // POST /api/session  { individualId }
@@ -120,7 +151,8 @@ async function verifyAndGenerate(req, res, next) {
   const user = req.rentalUser;
   const key = req.rentalKey;
   const ip = req.ip;
-  const reqFormat = String(req.body?.format || "pdf").toLowerCase();
+  const reqFormatRaw = String(req.body?.format || "pdf").toLowerCase().trim();
+  const reqFormat = FORMAT_ALIASES[reqFormatRaw] || reqFormatRaw;
   const format = FORMATS.includes(reqFormat) ? reqFormat : "pdf";
 
   try {
@@ -173,23 +205,28 @@ async function verifyAndGenerate(req, res, next) {
     // ── JSON: decoded fields, no render ──
     if (format === "json") {
       const { pdfData, cleanResponse } = sanitizeVerifyResponse(verifyResponse);
-      const raw = cleanResponse?.user?.data || cleanResponse?.data || {};
-      const IMG_KEYS = ["photo", "QRCodes", "qrCodes", "qrCode", "fronts", "front", "backs", "back"];
-      const data = {};
-      for (const [k, v] of Object.entries(raw)) {
-        if (!IMG_KEYS.includes(k)) data[k] = v;
-      }
-      const personName = safeFilename(pdfData.fullName_eng, fallbackName);
-      await finishCount(personName);
+      const payload = buildJsonPayload(cleanResponse, pdfData, fallbackName);
+      await finishCount(payload.name);
+      return res.json({ ok: true, format: "json", ...payload });
+    }
+
+    // ── PDF + JSON: decoded fields AND the rendered PDF (base64), one request ──
+    // Same id-data shape as `json`, plus a `pdf` object carrying the rendered
+    // document as base64. Counts/charges exactly once (one verify, one render).
+    if (format === "pdf_json") {
+      const { pdfBytes, pdfData, cleanResponse } = await generateDigitalIdPdf(verifyResponse);
+      const payload = buildJsonPayload(cleanResponse, pdfData, fallbackName);
+      const pdfBuffer = Buffer.from(pdfBytes);
+      await finishCount(payload.name);
       return res.json({
         ok: true,
-        format: "json",
-        name: personName,
-        data,
-        photo: pdfData.photo || null,
-        qr: pdfData.QRCodes || null,
-        front: pdfData.fronts || null,
-        back: pdfData.backs || null
+        format: "pdf_json",
+        ...payload,
+        pdf: {
+          filename: `${payload.name}.pdf`,
+          contentType: "application/pdf",
+          base64: pdfBuffer.toString("base64")
+        }
       });
     }
 

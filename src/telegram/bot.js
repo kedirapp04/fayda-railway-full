@@ -9,6 +9,30 @@ let bot = null;
 
 const isAdmin = (tgId) => env.ADMIN_TELEGRAM_IDS.includes(String(tgId));
 
+// Money formatter: integers stay clean, decimals show 2 places.
+const money = (n) => {
+  const v = Number(n || 0);
+  return Number.isInteger(v) ? String(v) : v.toFixed(2);
+};
+
+// Inline Yes/No keyboard for confirming a destructive action.
+const confirmKb = (yesData, noData) => ({
+  reply_markup: { inline_keyboard: [[
+    { text: "✅ Yes", callback_data: yesData },
+    { text: "⬅ No", callback_data: noData }
+  ]] }
+});
+
+// Admin chat → awaited manual numeric input ({ kind, userId?, chatId, msgId }).
+// Set when an admin taps a "Set Price / Add Balance / …" button; consumed by the
+// global message handler when they reply with a number.
+const pendingInput = new Map();
+
+// User chat → awaited payment receipt ({ userId, scope, saveId, amount }). Set
+// when a user taps Pay All / Pay #id; consumed by the message handler when they
+// send the receipt (text, photo, or PDF).
+const pendingReceipt = new Map();
+
 // Server 4 App Check token status, from the decoded JWT `exp` (real expiry).
 function s4StatusLine(info) {
   if (!info.set) return "❌ Empty (Server 4 falls back to Server 3)";
@@ -23,6 +47,29 @@ const DOCS_PATH = path.join(__dirname, "..", "..", "userusage.md");
 function notifyAdmins(text) {
   if (!bot) return;
   env.ADMIN_TELEGRAM_IDS.forEach((id) => bot.sendMessage(id, text).catch(() => {}));
+}
+
+// Forward a submitted payment receipt to every admin with Approve/Reject buttons.
+async function notifyAdminsReceipt(req, u) {
+  if (!bot) return;
+  const who = u && u.username ? "@" + u.username : "#" + (u ? u.id : req.user_id);
+  const scopeLabel = req.scope === "all" ? "ALL unpaid" : `payment #${req.save_id}`;
+  const caption =
+    `💳 Payment request #${req.id}\n` +
+    `From: ${who} (#${req.user_id})\n` +
+    `For: ${scopeLabel} · amount ${money(req.amount)}` +
+    (req.receipt_text ? `\n🧾 Text: ${req.receipt_text}` : "");
+  const reply_markup = { inline_keyboard: [[
+    { text: "✅ Approve", callback_data: `a:payok:${req.id}` },
+    { text: "🚫 Reject", callback_data: `a:payno:${req.id}` }
+  ]] };
+  for (const id of env.ADMIN_TELEGRAM_IDS) {
+    try {
+      if (req.receipt_kind === "photo" && req.receipt_file_id) await bot.sendPhoto(id, req.receipt_file_id, { caption, reply_markup });
+      else if (req.receipt_kind === "document" && req.receipt_file_id) await bot.sendDocument(id, req.receipt_file_id, { caption, reply_markup });
+      else await bot.sendMessage(id, caption, { reply_markup });
+    } catch (_) {}
+  }
 }
 
 function requireUsername(from, chatId) {
@@ -42,16 +89,22 @@ async function ensureUser(from) {
 
 // ─── Menus (pure formatting from a stats object — sync) ──────────────────────
 function billingLine(s) {
-  if (s.billingMode === "prepaid") return `💳 Prepaid · balance ${s.balance} · ${s.price}/gen`;
-  if (s.billingMode === "postpaid") return `💳 Postpaid · owed ${s.owed}/${s.creditLimit || "∞"} · ${s.price}/gen`;
-  return `🔢 Counter · used ${s.totalSuccess}${s.totalLimit ? "/" + s.totalLimit : ""}`;
+  if (s.billingMode === "prepaid") return `💳 Prepaid · balance ${money(s.balance)} · ${money(s.price)}/gen`;
+  if (s.billingMode === "postpaid") return `💳 Postpaid · owed ${money(s.owed)}/${s.creditLimit || "∞"} · ${money(s.price)}/gen`;
+  return `🔢 Counter · used ${s.totalSuccess}${s.totalLimit ? "/" + s.totalLimit : ""} · ${money(s.price)}/gen`;
+}
+
+// Debt = this (unsaved) period valued at the current price + unpaid saved payments.
+function debtLine(s) {
+  return `💸 Debt: ${money(s.debt)} (this period ${money(s.debtLive)} + unpaid saved ${money(s.debtSaved)})`;
 }
 
 function userMenuText(u, s) {
   const who = u.username ? "@" + u.username : "your account";
   return `👤 ${who} — ${u.status}\n` +
     `Key: ${s.key ? s.key.key_prefix + "… (" + s.key.status + ")" : "none"}\n` +
-    `${billingLine(s)}\nGenerations: ${s.totalSuccess}${s.savedTotal ? " (+" + s.savedTotal + " saved)" : ""}`;
+    `${billingLine(s)}\n${debtLine(s)}\n` +
+    `Generations: ${s.totalSuccess}${s.savedTotal ? " (+" + s.savedTotal + " saved)" : ""}`;
 }
 
 async function userMenu(u, viewerIsAdmin) {
@@ -60,6 +113,7 @@ async function userMenu(u, viewerIsAdmin) {
   const active = u.status === "approved" || u.status === "trial";
   if (active) {
     rows.push([{ text: "📊 My Usage", callback_data: "u:usage" }, { text: "📁 My Saves", callback_data: "u:saves" }]);
+    rows.push([{ text: "💳 Pay Debt", callback_data: "u:pay" }, { text: "💵 Add Balance", callback_data: "u:addbalance" }]);
     if (s.key && s.key.status === "active") rows.push([{ text: "⏸ Pause Key", callback_data: "u:pausekey" }, { text: "🗑 Revoke & Replace", callback_data: "u:revokekey" }]);
     else if (s.key && s.key.status === "paused") rows.push([{ text: "▶️ Resume Key", callback_data: "u:resumekey" }, { text: "🗑 Revoke & Replace", callback_data: "u:revokekey" }]);
     else rows.push([{ text: "🗑 Revoke & Replace", callback_data: "u:revokekey" }]);
@@ -84,9 +138,9 @@ async function adminPanel() {
 
 async function gpriceMenu() {
   return {
-    text: `🌐 Global price per generation: ${await store.globalPrice()}\nSet a new default (per-user overrides still win). Use /gprice <n> for any value.`,
+    text: `🌐 Global price per generation: ${await store.globalPrice()}\nTap to set a new default (per-user overrides still win). Or use /gprice <n>.`,
     markup: { reply_markup: { inline_keyboard: [
-      [{ text: "5", callback_data: "a:gset:5" }, { text: "10", callback_data: "a:gset:10" }, { text: "20", callback_data: "a:gset:20" }, { text: "50", callback_data: "a:gset:50" }],
+      [{ text: "✏️ Set Global Price", callback_data: "a:askgprice" }],
       [{ text: "⬅ Panel", callback_data: "a:panel" }]
     ] } }
   };
@@ -103,11 +157,14 @@ async function userCard(u) {
   const text =
     `👤 ${u.username ? "@" + u.username : "(no username)"}  ·  id #${u.id}\n` +
     `status: ${u.status} · mode: ${s.billingMode}\n` +
-    `price: ${s.price}${s.priceOverride != null ? " (override)" : " (global)"} · ${moneyLine(u, s)}\n` +
+    `price: ${money(s.price)}${s.priceOverride != null ? " (override)" : " (global)"} · ${moneyLine(u, s)}\n` +
+    `${debtLine(s)}\n` +
     `key: ${s.key ? s.key.key_prefix + "… (" + s.key.status + ")" : "none"}\n` +
     `gens: today ${s.todaySuccess} · period ${s.totalSuccess} · saved ${s.savedTotal} · life ${s.lifetime}`;
   const rows = [];
-  if (u.status !== "approved") rows.push([{ text: "✅ Approve + Docs", callback_data: `a:approve:${u.id}` }]);
+  // Approve only for users who were never approved (pending/trial/revoked).
+  // A paused user is already approved — show Resume (below), not Approve.
+  if (!["approved", "paused"].includes(u.status)) rows.push([{ text: "✅ Approve + Docs", callback_data: `a:approve:${u.id}` }]);
   if (u.status === "paused") rows.push([{ text: "▶️ Resume", callback_data: `a:resume:${u.id}` }]);
   else if (u.status === "approved" || u.status === "trial") rows.push([{ text: "⏸ Pause", callback_data: `a:pause:${u.id}` }]);
   rows.push([{ text: "💳 Billing", callback_data: `a:billing:${u.id}` }, { text: "📏 Limits", callback_data: `a:limits:${u.id}` }]);
@@ -120,17 +177,18 @@ async function userCard(u) {
 async function billingMenu(u) {
   const s = await store.getUserStats(u.id);
   const text = `💳 Billing — ${u.username ? "@" + u.username : "#" + u.id}\n` +
-    `Mode: ${s.billingMode} · price: ${s.price}${s.priceOverride != null ? " (override)" : " (global)"}\n` +
-    `Prepaid balance: ${s.balance}\nPostpaid owed: ${s.owed}/${s.creditLimit || "∞"}`;
+    `Mode: ${s.billingMode} · price: ${money(s.price)}${s.priceOverride != null ? " (override)" : " (global)"}\n` +
+    `Prepaid balance: ${money(s.balance)}\nPostpaid owed: ${money(s.owed)}/${s.creditLimit || "∞"}\n` +
+    `${debtLine(s)}`;
   const id = u.id;
   return { text, markup: { reply_markup: { inline_keyboard: [
     [{ text: (s.billingMode === "counter" ? "● " : "") + "🔢 Counter", callback_data: `a:mode:${id}:counter` },
      { text: (s.billingMode === "prepaid" ? "● " : "") + "💰 Prepaid", callback_data: `a:mode:${id}:prepaid` },
      { text: (s.billingMode === "postpaid" ? "● " : "") + "🧾 Postpaid", callback_data: `a:mode:${id}:postpaid` }],
-    [{ text: "Top +50", callback_data: `a:topup:${id}:50` }, { text: "+100", callback_data: `a:topup:${id}:100` }, { text: "+500", callback_data: `a:topup:${id}:500` }],
-    [{ text: "Price 5", callback_data: `a:price:${id}:5` }, { text: "10", callback_data: `a:price:${id}:10` }, { text: "20", callback_data: `a:price:${id}:20` }, { text: "Global", callback_data: `a:price:${id}:clear` }],
-    [{ text: "Credit 100", callback_data: `a:credit:${id}:100` }, { text: "500", callback_data: `a:credit:${id}:500` }, { text: "1000", callback_data: `a:credit:${id}:1000` }],
-    [{ text: "🧾 Settle owed", callback_data: `a:settle:${id}` }, { text: "⬅ Back", callback_data: `a:user:${id}` }]
+    [{ text: "💵 Add Balance", callback_data: `a:asktopup:${id}` }, { text: "💲 Set Price", callback_data: `a:askprice:${id}` }, { text: "🌐 Use Global", callback_data: `a:price:${id}:clear` }],
+    [{ text: "🧾 Set Postpaid Limit", callback_data: `a:askcredit:${id}` }, { text: "🧾 Settle owed", callback_data: `a:settle:${id}` }],
+    [{ text: "✅ Mark Current Paid", callback_data: `a:paidnow:${id}` }, { text: "📁 Saves", callback_data: `a:saves:${id}` }],
+    [{ text: "⬅ Back", callback_data: `a:user:${id}` }]
   ] } } };
 }
 
@@ -148,19 +206,42 @@ function limitsMenu(u) {
 async function adminSavesMenu(u) {
   const saves = await store.listSaves(u.id);
   const total = await store.savesTotal(u.id);
+  const unpaid = await store.unpaidSavedAmount(u.id);
   const lines = saves.length
-    ? saves.map((sv) => `#${sv.id}: ${sv.saved_count} — ${sv.saved_at.slice(0, 16).replace("T", " ")}`).join("\n")
+    ? saves.map((sv) => `#${sv.id}: ${sv.saved_count}×${money(sv.price)} = ${money(sv.amount)} ${sv.paid ? "✅ paid" : "🔴 unpaid"} — ${sv.saved_at.slice(0, 16).replace("T", " ")}`).join("\n")
     : "(no saves yet)";
-  const rows = saves.slice(0, 12).map((sv) => [{ text: `🗑 Clear #${sv.id} (${sv.saved_count})`, callback_data: `a:clearsave:${sv.id}:${u.id}` }]);
+  const rows = saves.slice(0, 8).map((sv) => ([
+    sv.paid
+      ? { text: `↩ Mark Unpaid #${sv.id}`, callback_data: `a:markunpaid:${sv.id}:${u.id}` }
+      : { text: `✅ Mark Paid #${sv.id} (${money(sv.amount)})`, callback_data: `a:markpaid:${sv.id}:${u.id}` },
+    { text: `🗑 Clear #${sv.id}`, callback_data: `a:clearsave:${sv.id}:${u.id}` }
+  ]));
   rows.push([{ text: "⬅ Back", callback_data: `a:user:${u.id}` }]);
-  return { text: `📁 Saves for ${u.username ? "@" + u.username : "#" + u.id} — total ${total}\n\n${lines}`, markup: { reply_markup: { inline_keyboard: rows } } };
+  return { text: `📁 Saves/payments for ${u.username ? "@" + u.username : "#" + u.id} — gens saved ${total} · 🔴 unpaid ${money(unpaid)}\n\n${lines}`, markup: { reply_markup: { inline_keyboard: rows } } };
 }
 
 async function userSavesText(u) {
   const s = await store.getUserStats(u.id);
   const saves = await store.listSaves(u.id);
-  const lines = saves.length ? saves.map((sv) => `• ${sv.saved_count} — ${sv.saved_at.slice(0, 10)}`).join("\n") : "(no saved periods yet)";
-  return `📁 Your usage\n${billingLine(s)}\nGenerations: ${s.totalSuccess}${s.totalLimit ? "/" + s.totalLimit : ""} · saved ${s.savedTotal} · lifetime ${s.lifetime}\n\n${lines}`;
+  const lines = saves.length ? saves.map((sv) => `• ${sv.saved_count}×${money(sv.price)} = ${money(sv.amount)} ${sv.paid ? "✅ paid" : "🔴 unpaid"} — ${sv.saved_at.slice(0, 10)}`).join("\n") : "(no saved periods yet)";
+  return `📁 Your usage\n${billingLine(s)}\n${debtLine(s)}\nGenerations: ${s.totalSuccess}${s.totalLimit ? "/" + s.totalLimit : ""} · saved ${s.savedTotal} · lifetime ${s.lifetime}\n\n${lines}`;
+}
+
+// User-facing "pay" menu: list unpaid saved payments with a per-item pay button
+// plus a Pay-All button. In manual mode each "pay" sends a settlement request to
+// admins (who confirm with Mark Paid); CBE self-service will replace the request.
+async function userPayMenu(u) {
+  const s = await store.getUserStats(u.id);
+  const unpaid = await store.listUnpaidSaves(u.id);
+  const lines = unpaid.length
+    ? unpaid.map((sv) => `#${sv.id}: ${sv.saved_count}×${money(sv.price)} = ${money(sv.amount)} 🔴`).join("\n")
+    : "(nothing unpaid 🎉)";
+  const rows = [];
+  if (unpaid.length) rows.push([{ text: `💵 Pay All (${money(s.debtSaved)})`, callback_data: "u:payall" }]);
+  unpaid.slice(0, 8).forEach((sv) => rows.push([{ text: `💳 Pay #${sv.id} (${money(sv.amount)})`, callback_data: `u:payone:${sv.id}` }]));
+  rows.push([{ text: "⬅ Back", callback_data: "u:menu" }]);
+  const note = s.debtLive > 0 ? `\n(This period's ${money(s.debtLive)} becomes payable once an admin saves it.)` : "";
+  return { text: `💳 Pay your debt\n${debtLine(s)}\n\nUnpaid payments:\n${lines}${note}`, markup: { reply_markup: { inline_keyboard: rows } } };
 }
 
 // ─── Senders ────────────────────────────────────────────────────────────
@@ -278,6 +359,68 @@ function start() {
     await bot.sendMessage(chatId, "📄 For the full developer guide, tap “Request Full Access + Docs”.");
   }
 
+  // Manual numeric input for the admin "Set Price / Add Balance / Postpaid
+  // Limit / Global Price" prompts. Only acts when that chat has a pending ask;
+  // ignores everything else so normal commands/messages pass through untouched.
+  bot.on("message", async (msg) => {
+    try {
+      const key = String(msg.chat.id);
+
+      // (a) User payment receipt capture (text, photo, or PDF/document).
+      const pr = pendingReceipt.get(key);
+      if (pr) {
+        const caption = String(msg.text || msg.caption || "").trim();
+        if (caption && /^\/cancel\b/i.test(caption)) { pendingReceipt.delete(key); bot.sendMessage(msg.chat.id, "✖️ Payment cancelled."); return; }
+        let receiptKind = null, receiptText = null, receiptFileId = null;
+        if (Array.isArray(msg.photo) && msg.photo.length) {
+          receiptKind = "photo"; receiptFileId = msg.photo[msg.photo.length - 1].file_id; receiptText = msg.caption ? String(msg.caption) : null;
+        } else if (msg.document) {
+          receiptKind = "document"; receiptFileId = msg.document.file_id; receiptText = msg.caption ? String(msg.caption) : null;
+        } else if (caption) {
+          receiptKind = "text"; receiptText = caption;
+        } else {
+          bot.sendMessage(msg.chat.id, "Send the receipt as text, a photo, or a PDF — or /cancel.");
+          return;
+        }
+        pendingReceipt.delete(key);
+        const owner = await store.getUserById(pr.userId);
+        const req = await store.createPaymentRequest({
+          userId: pr.userId, scope: pr.scope, saveId: pr.saveId, amount: pr.amount,
+          receiptKind, receiptText, receiptFileId
+        });
+        await bot.sendMessage(msg.chat.id, `✅ Receipt submitted (request #${req.id}, ${money(pr.amount)}). An admin will review it shortly.`);
+        await notifyAdminsReceipt(req, owner);
+        return;
+      }
+
+      // (b) Admin manual numeric input.
+      const pend = pendingInput.get(key);
+      if (!pend) return;
+      const text = String(msg.text || "").trim();
+      if (!text) return;
+      if (text.startsWith("/")) {
+        if (/^\/cancel\b/i.test(text)) { pendingInput.delete(key); bot.sendMessage(msg.chat.id, "✖️ Cancelled."); }
+        return; // let other commands run normally
+      }
+      if (!isAdmin(msg.from.id)) { pendingInput.delete(key); return; }
+      const num = Number(text.replace(/[, ]+/g, ""));
+      if (!Number.isFinite(num) || num < 0) { bot.sendMessage(msg.chat.id, "Send a non-negative number, or /cancel."); return; }
+      pendingInput.delete(key);
+      const editMenu = (t, markup) => bot.editMessageText(t, { chat_id: pend.chatId, message_id: pend.msgId, ...(markup || {}) }).catch(() => {});
+      if (pend.kind === "gprice") {
+        const v = await store.setGlobalPrice(num);
+        await bot.sendMessage(msg.chat.id, `🌐 Global price → ${v}`);
+        const gm = await gpriceMenu(); return editMenu(gm.text, gm.markup);
+      }
+      const target = await store.getUserById(pend.userId);
+      if (!target) { await bot.sendMessage(msg.chat.id, "No such user."); return; }
+      if (pend.kind === "price") { await store.setPrice(target.id, num); await bot.sendMessage(msg.chat.id, `💲 Price for #${target.id} → ${money(num)}`); }
+      else if (pend.kind === "topup") { const uu = await store.topUp(target.id, num); await bot.sendMessage(msg.chat.id, `💵 #${target.id} balance → ${money(uu.balance)}`); }
+      else if (pend.kind === "credit") { const uu = await store.setCreditLimit(target.id, num); await bot.sendMessage(msg.chat.id, `🧾 #${target.id} postpaid limit → ${money(uu.credit_limit)}`); }
+      const bm = await billingMenu(await store.getUserById(target.id)); return editMenu(bm.text, bm.markup);
+    } catch (e) { console.warn("[tg input]", e?.message || e); }
+  });
+
   bot.on("callback_query", async (q) => {
     const fromId = q.from.id;
     const chatId = q.message.chat.id;
@@ -287,19 +430,55 @@ function start() {
     const edit = (text, markup) => bot.editMessageText(text, { chat_id: chatId, message_id: msgId, ...(markup || {}) }).catch(() => {});
     const reRenderMenu = async (u) => { const m = await userMenu(u, isAdmin(fromId)); return edit(m.text, m.markup); };
 
+    // Any button press abandons a half-finished manual-input / receipt prompt for
+    // this chat. (The ask*/pay* handlers below re-set it immediately after.)
+    pendingInput.delete(String(chatId));
+    pendingReceipt.delete(String(chatId));
+
     try {
       if (data.startsWith("u:")) {
         if (!q.from.username) return ack("Set a Telegram username first");
         const u = await ensureUser(q.from);
-        const action = data.slice(2);
+        const uparts = data.split(":");
+        const action = uparts[1];
         if (action === "request") {
           if (u.status === "approved") ack("Already approved");
           else { await store.setUserStatus(u.id, "pending"); ack("Request sent — admin will review"); notifyAdmins(`🆕 Access+docs request from @${u.username || "?"} (id #${u.id})`); }
         } else if (action === "usage" || action === "saves") { ack(); await bot.sendMessage(chatId, await userSavesText(u)); }
         else if (action === "tester") { ack("Issuing tester key…"); await claimTesterFlow(chatId, u); }
+        else if (action === "addbalance") {
+          // Pre-CBE: notify admins to top up manually. (CBE self-service drops in here.)
+          ack("Admins notified");
+          const s = await store.getUserStats(u.id);
+          notifyAdmins(`💵 @${u.username || "?"} (#${u.id}) wants to ADD BALANCE.\nDebt: ${money(s.debt)} · balance: ${money(s.balance)}. Open their Billing to top up.`);
+          await bot.sendMessage(chatId, "💵 An admin has been notified to add your balance. (Direct CBE payment is coming soon.)");
+        }
+        else if (action === "pay") { ack(); const pm = await userPayMenu(u); return edit(pm.text, pm.markup); }
+        else if (action === "payall") {
+          const unpaid = await store.listUnpaidSaves(u.id);
+          if (!unpaid.length) { ack("Nothing to pay"); const pm = await userPayMenu(u); return edit(pm.text, pm.markup); }
+          const s = await store.getUserStats(u.id);
+          pendingReceipt.set(String(chatId), { userId: u.id, scope: "all", saveId: null, amount: s.debtSaved });
+          ack();
+          return edit(`💳 Pay All — ${money(s.debtSaved)}\n\nSend your payment receipt now: paste the transaction ID / SMS text, or send a photo/PDF of the receipt.\n(Send /cancel to abort.)`,
+            { reply_markup: { inline_keyboard: [[{ text: "⬅ Cancel", callback_data: "u:pay" }]] } });
+        }
+        else if (action === "payone") {
+          const sv = (await store.listUnpaidSaves(u.id)).find((x) => String(x.id) === String(uparts[2]));
+          if (!sv) { ack("Already settled"); const pm = await userPayMenu(u); return edit(pm.text, pm.markup); }
+          pendingReceipt.set(String(chatId), { userId: u.id, scope: "one", saveId: sv.id, amount: sv.amount });
+          ack();
+          return edit(`💳 Pay #${sv.id} — ${money(sv.amount)}\n\nSend your payment receipt now: paste the transaction ID / SMS text, or send a photo/PDF of the receipt.\n(Send /cancel to abort.)`,
+            { reply_markup: { inline_keyboard: [[{ text: "⬅ Cancel", callback_data: "u:pay" }]] } });
+        }
         else if (action === "pausekey") { await store.setKeyStatus(u.id, "paused"); ack("Key paused"); }
         else if (action === "resumekey") { await store.setKeyStatus(u.id, "active"); ack("Key active"); }
         else if (action === "revokekey") {
+          if (uparts[2] !== "yes") {
+            ack();
+            return edit("🗑 Revoke & replace your key?\nThe old key stops working immediately (usage is kept).",
+              confirmKb("u:revokekey:yes", "u:menu"));
+          }
           const { rawKey } = await store.revokeAndReissue(u.id);
           ack("Old key deleted · new key issued");
           await sendKey(chatId, rawKey, "🗑→🔑 Old key deleted. Your usage is kept.\nNew API key (shown once):");
@@ -323,6 +502,49 @@ function start() {
         }
         if (action === "gprice") { ack(); const gm = await gpriceMenu(); return edit(gm.text, gm.markup); }
         if (action === "gset") { await store.setGlobalPrice(parts[2]); ack(`Global price → ${parts[2]}`); const gm = await gpriceMenu(); return edit(gm.text, gm.markup); }
+        if (action === "askgprice") {
+          pendingInput.set(String(fromId), { kind: "gprice", chatId, msgId });
+          ack();
+          return edit("✏️ Send the new GLOBAL price per generation as a number.\n(Send /cancel to abort.)",
+            { reply_markup: { inline_keyboard: [[{ text: "⬅ Cancel", callback_data: "a:gprice" }]] } });
+        }
+        if (action === "noop") { return ack(); }
+        // Payment-request review: parts[2] = request id.
+        if (action === "payok" || action === "payno") {
+          const req = await store.getPaymentRequest(parts[2]);
+          if (!req) return ack("Request gone");
+          if (req.status !== "pending") { return ack(`Already ${req.status}`); }
+          const owner = await store.getUserById(req.user_id);
+          if (action === "payok") {
+            if (req.scope === "all") await store.markAllUnpaidPaid(req.user_id);
+            else if (req.save_id != null) await store.markSavePaid(req.save_id, true);
+            await store.decidePaymentRequest(req.id, "approved", fromId);
+            ack("Approved · marked paid");
+            if (owner && owner.telegram_id) bot.sendMessage(owner.telegram_id, `✅ Your payment (request #${req.id}, ${money(req.amount)}) was approved. Thank you!`).catch(() => {});
+          } else {
+            await store.decidePaymentRequest(req.id, "rejected", fromId);
+            ack("Rejected");
+            if (owner && owner.telegram_id) bot.sendMessage(owner.telegram_id, `🚫 Your payment (request #${req.id}) was rejected. Please check it and resend a valid receipt.`).catch(() => {});
+          }
+          // Strip the buttons from the admin's message so it can't be re-decided.
+          try { await bot.editMessageReplyMarkup({ inline_keyboard: [[{ text: action === "payok" ? "✅ Approved" : "🚫 Rejected", callback_data: "a:noop" }]] }, { chat_id: chatId, message_id: msgId }); } catch (_) {}
+          return;
+        }
+        // Save/payment-targeted actions: parts[2] = saveId, parts[3] = userId.
+        if (action === "clearsave" || action === "markpaid" || action === "markunpaid") {
+          const saveId = parts[2], ownerId = parts[3], confirmed = parts[4] === "yes";
+          if ((action === "clearsave" || action === "markpaid") && !confirmed) {
+            ack();
+            const ask = action === "clearsave" ? "🗑 Delete this saved payment record?" : "✅ Mark this payment as PAID?";
+            return edit(ask, confirmKb(`a:${action}:${saveId}:${ownerId}:yes`, `a:saves:${ownerId}`));
+          }
+          if (action === "clearsave") { await store.clearSave(saveId); ack("Save cleared"); }
+          else if (action === "markpaid") { await store.markSavePaid(saveId, true); ack("Marked paid"); }
+          else { await store.markSavePaid(saveId, false); ack("Marked unpaid"); }
+          const owner = await store.getUserById(ownerId);
+          if (owner) { const sm = await adminSavesMenu(owner); return edit(sm.text, sm.markup); }
+          return edit("🛠 Admin Panel", await adminPanel());
+        }
         if (action === "s4token") {
           ack();
           const info = await store.getServer4TokenInfo();
@@ -357,6 +579,15 @@ function start() {
         } else if (action === "mode") {
           await store.setBillingMode(target.id, parts[3]); ack(`Mode → ${parts[3]}`);
           const bm = await billingMenu(await store.getUserById(target.id)); return edit(bm.text, bm.markup);
+        } else if (action === "askprice" || action === "asktopup" || action === "askcredit") {
+          const kind = action === "askprice" ? "price" : action === "asktopup" ? "topup" : "credit";
+          pendingInput.set(String(fromId), { kind, userId: target.id, chatId, msgId });
+          const label = kind === "price" ? "new price per generation"
+            : kind === "topup" ? "amount to ADD to the balance"
+            : "postpaid credit limit";
+          ack();
+          return edit(`✏️ Send the ${label} for ${target.username ? "@" + target.username : "#" + target.id} as a number.\n(Send /cancel to abort.)`,
+            { reply_markup: { inline_keyboard: [[{ text: "⬅ Cancel", callback_data: `a:billing:${target.id}` }]] } });
         } else if (action === "topup") {
           await store.topUp(target.id, parts[3]); ack(`+${parts[3]} added`);
           const bm = await billingMenu(await store.getUserById(target.id)); return edit(bm.text, bm.markup);
@@ -367,7 +598,17 @@ function start() {
           await store.setCreditLimit(target.id, parts[3]); ack(`Credit limit ${parts[3]}`);
           const bm = await billingMenu(await store.getUserById(target.id)); return edit(bm.text, bm.markup);
         } else if (action === "settle") {
+          if (parts[3] !== "yes") { ack(); return edit(`🧾 Settle owed for ${target.username ? "@" + target.username : "#" + target.id} to 0?`, confirmKb(`a:settle:${target.id}:yes`, `a:billing:${target.id}`)); }
           await store.settleOwed(target.id); ack("Owed reset to 0");
+          const bm = await billingMenu(await store.getUserById(target.id)); return edit(bm.text, bm.markup);
+        } else if (action === "paidnow") {
+          if (parts[3] !== "yes") {
+            const s = await store.getUserStats(target.id);
+            ack();
+            return edit(`✅ Mark current debt for ${target.username ? "@" + target.username : "#" + target.id} as PAID?\nSnapshots this period (${money(s.debtLive)}) as a paid payment and resets the counter.`,
+              confirmKb(`a:paidnow:${target.id}:yes`, `a:billing:${target.id}`));
+          }
+          const r = await store.settleCurrentPaid(target.id); ack(`Settled ${money(r.amount)} as paid`);
           const bm = await billingMenu(await store.getUserById(target.id)); return edit(bm.text, bm.markup);
         } else if (action === "senddocs") {
           ack("Docs sent");
@@ -379,6 +620,11 @@ function start() {
           await store.setUserStatus(target.id, "approved"); ack("Resumed");
           if (target.telegram_id) bot.sendMessage(target.telegram_id, "▶️ Your API access was resumed.").catch(() => {});
         } else if (action === "revoke") {
+          if (parts[3] !== "yes") {
+            ack();
+            return edit(`🗑 Revoke ${target.username ? "@" + target.username : "#" + target.id}?\nThis blocks their access and revokes their key.`,
+              confirmKb(`a:revoke:${target.id}:yes`, `a:user:${target.id}`));
+          }
           await store.setUserStatus(target.id, "revoked"); await store.setKeyStatus(target.id, "revoked"); ack("Revoked");
           if (target.telegram_id) bot.sendMessage(target.telegram_id, "🗑️ Your API access was revoked.").catch(() => {});
         } else if (action === "daily") {
@@ -388,12 +634,8 @@ function start() {
           await store.setLimits(target.id, target.daily_limit, parts[3]); ack("Total set");
           const lm = limitsMenu(await store.getUserById(target.id)); return edit(lm.text, lm.markup);
         } else if (action === "save") {
-          const saved = await store.saveCounterAndReset(target.id); ack(`Saved ${saved}, counter reset`);
-        } else if (action === "clearsave") {
-          await store.clearSave(parts[2]); ack("Save cleared");
-          const owner = await store.getUserById(parts[3]);
-          if (owner) { const sm = await adminSavesMenu(owner); return edit(sm.text, sm.markup); }
-          return edit("🛠 Admin Panel", await adminPanel());
+          const r = await store.saveCounterAndReset(target.id);
+          ack(`Saved ${r.saved} gens = ${money(r.amount)} (unpaid), counter reset`);
         }
 
         const c = await userCard(await store.getUserById(target.id));

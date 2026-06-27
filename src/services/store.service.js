@@ -283,18 +283,87 @@ async function savesTotal(userId) {
   const r = await one(`SELECT COALESCE(SUM(saved_count),0)::int AS t FROM counter_saves WHERE user_id = $1`, [Number(userId)]);
   return r ? r.t : 0;
 }
-// Snapshot the current live count into a saved period, then reset to 0.
+// Sum of saved payment amounts that are still unpaid (the frozen debt the user
+// owes for past, already-archived periods).
+async function unpaidSavedAmount(userId) {
+  const r = await one(
+    `SELECT COALESCE(SUM(amount),0)::float8 AS t FROM counter_saves WHERE user_id = $1 AND paid = 0`,
+    [Number(userId)]
+  );
+  return r ? Number(r.t) : 0;
+}
+async function listUnpaidSaves(userId) {
+  return query(`SELECT * FROM counter_saves WHERE user_id = $1 AND paid = 0 ORDER BY id DESC`, [Number(userId)]);
+}
+// Snapshot the current live count into a saved period AND freeze it as a payment
+// record (price at save time → amount), then reset the live counter to 0.
 async function saveCounterAndReset(userId, note) {
+  const user = await getUserById(userId);
   const key = await getActiveKeyForUser(userId);
   const current = key ? key.success_count : 0;
-  await query(`INSERT INTO counter_saves (user_id, saved_count, saved_at, note) VALUES ($1, $2, $3, $4)`,
-    [Number(userId), current, nowIso(), note || null]);
+  const price = await effectivePrice(user);
+  const amount = current * price;
+  await query(
+    `INSERT INTO counter_saves (user_id, saved_count, saved_at, note, price, amount, paid)
+     VALUES ($1, $2, $3, $4, $5, $6, 0)`,
+    [Number(userId), current, nowIso(), note || null, price, amount]
+  );
   if (key) await query(`UPDATE api_keys SET success_count = 0 WHERE id = $1`, [key.id]);
-  return current;
+  return { saved: current, price, amount };
+}
+// One-tap settle of the CURRENT (unsaved) period: snapshot it as an already-PAID
+// payment record at the current price, then reset the live counter. Use when the
+// user has paid for everything they've generated this period.
+async function settleCurrentPaid(userId, note) {
+  const user = await getUserById(userId);
+  const key = await getActiveKeyForUser(userId);
+  const current = key ? key.success_count : 0;
+  const price = await effectivePrice(user);
+  const amount = current * price;
+  const at = nowIso();
+  await query(
+    `INSERT INTO counter_saves (user_id, saved_count, saved_at, note, price, amount, paid, paid_at)
+     VALUES ($1, $2, $3, $4, $5, $6, 1, $3)`,
+    [Number(userId), current, at, note || "settled paid", price, amount]
+  );
+  if (key) await query(`UPDATE api_keys SET success_count = 0 WHERE id = $1`, [key.id]);
+  return { saved: current, price, amount };
+}
+// Mark a saved payment paid (or unpaid). Returns the updated row.
+async function markSavePaid(saveId, paid = true) {
+  await query(
+    `UPDATE counter_saves SET paid = $1, paid_at = $2 WHERE id = $3`,
+    [paid ? 1 : 0, paid ? nowIso() : null, Number(saveId)]
+  );
+  return one(`SELECT * FROM counter_saves WHERE id = $1`, [Number(saveId)]);
 }
 async function clearSave(saveId) {
   const r = await pool.query(`DELETE FROM counter_saves WHERE id = $1`, [Number(saveId)]);
   return r.rowCount;
+}
+// Settle every still-unpaid save for a user (used by an approved "Pay All").
+async function markAllUnpaidPaid(userId) {
+  await query(`UPDATE counter_saves SET paid = 1, paid_at = $1 WHERE user_id = $2 AND paid = 0`,
+    [nowIso(), Number(userId)]);
+}
+
+// ─── Payment requests (user receipt → admin approve/reject) ─────────────
+async function createPaymentRequest({ userId, scope, saveId, amount, receiptKind, receiptText, receiptFileId }) {
+  return one(
+    `INSERT INTO payment_requests
+       (user_id, scope, save_id, amount, receipt_kind, receipt_text, receipt_file_id, status, created_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8) RETURNING *`,
+    [Number(userId), String(scope), saveId != null ? Number(saveId) : null, Number(amount) || 0,
+     receiptKind || null, receiptText || null, receiptFileId || null, nowIso()]
+  );
+}
+async function getPaymentRequest(id) {
+  return one(`SELECT * FROM payment_requests WHERE id = $1`, [Number(id)]);
+}
+async function decidePaymentRequest(id, status, decidedBy) {
+  await query(`UPDATE payment_requests SET status = $1, decided_at = $2, decided_by = $3 WHERE id = $4`,
+    [String(status), nowIso(), String(decidedBy || ""), Number(id)]);
+  return getPaymentRequest(id);
 }
 
 async function getUserStats(userId) {
@@ -304,6 +373,11 @@ async function getUserStats(userId) {
   const current = key ? key.success_count : 0;
   const saved = await savesTotal(userId);
   const saves = await listSaves(userId);
+  const price = await effectivePrice(user);
+  // Debt = the current (unsaved) period valued at the CURRENT price, plus any
+  // already-saved payments still marked unpaid.
+  const debtLive = current * price;
+  const debtSaved = await unpaidSavedAmount(userId);
   return {
     user,
     key,
@@ -315,11 +389,14 @@ async function getUserStats(userId) {
     dailyLimit: user.daily_limit,
     totalLimit: user.total_limit,
     billingMode: user.billing_mode,
-    price: await effectivePrice(user),
+    price,
     priceOverride: user.price_override,
     balance: user.balance,
     owed: user.owed,
-    creditLimit: user.credit_limit
+    creditLimit: user.credit_limit,
+    debtLive,
+    debtSaved,
+    debt: debtLive + debtSaved
   };
 }
 
@@ -343,8 +420,16 @@ module.exports = {
   recordUsage,
   listSaves,
   savesTotal,
+  unpaidSavedAmount,
+  listUnpaidSaves,
   saveCounterAndReset,
+  settleCurrentPaid,
+  markSavePaid,
   clearSave,
+  markAllUnpaidPaid,
+  createPaymentRequest,
+  getPaymentRequest,
+  decidePaymentRequest,
   getUserStats,
   globalPrice,
   setGlobalPrice,

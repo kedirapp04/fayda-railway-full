@@ -44,7 +44,7 @@
 <body>
 <div class="wrap">
   <h1>Fayda API Tester</h1>
-  <p class="sub">One service: send OTP → verify OTP renders the document (PDF / screenshot / JSON) in-process.</p>
+  <p class="sub">One service: send OTP → verify OTP renders the document (PDF / screenshot / JSON / PDF + JSON) in-process.</p>
 
   <!-- Config -->
   <div class="card">
@@ -77,11 +77,11 @@
       <div><label>Session ID</label><input id="sid" type="text" placeholder="(from step 1)" /></div>
       <div><label>OTP code</label><input id="otp" type="text" placeholder="123456" /></div>
       <div><label>Format</label>
-        <select id="format"><option value="pdf">PDF</option><option value="screenshot">Screenshot</option><option value="json">JSON (user data)</option></select>
+        <select id="format"><option value="pdf">PDF</option><option value="screenshot">Screenshot</option><option value="json">JSON (user data)</option><option value="pdf_json">PDF + JSON</option></select>
       </div>
     </div>
     <button onclick="verify()">Verify &amp; render</button>
-    <div class="hint">One render per verify — the OTP/session is consumed. To get another format, send a fresh OTP.</div>
+    <div class="hint">One render per verify — the OTP/session is consumed. Need both a PDF and the JSON? Pick <b>PDF + JSON</b>. Other combinations need a fresh OTP.</div>
     <div id="s2status" class="status"></div>
     <div id="dl"></div>
     <div id="imgs" class="imgs"></div>
@@ -186,11 +186,20 @@ async function verify() {
       dl.append(title, aDl, bView);
       $("pdfFrame").src = url; $("pdfFrame").hidden = false;
       setStatus("s2status", "PDF ready for " + name + ".", "ok");
-    } else if (format === "json") {
+    } else if (format === "json" || format === "pdf_json") {
       const j = await r.json();
       if (!j.ok) return setStatus("s2status", "Error: " + j.error, "err");
       $("dl").innerHTML = `<div><b>👤 ${j.name || "result"}</b></div>`;
       $("imgs").innerHTML = "";
+      // Combined pdf_json: surface a PDF download/view from the base64 first.
+      if (j.pdf && j.pdf.base64) {
+        const purl = b64ToBlobUrl(j.pdf.base64, j.pdf.contentType || "application/pdf");
+        const fileName = j.pdf.filename || ((j.name || "fayda") + ".pdf");
+        const aPdf = document.createElement("a"); aPdf.className = "btn2"; aPdf.href = purl; aPdf.download = fileName; aPdf.textContent = "⬇ Download PDF";
+        const bView = document.createElement("button"); bView.className = "btn2 sec"; bView.textContent = "👁 View PDF"; bView.onclick = () => window.open(purl, "_blank");
+        $("dl").append(aPdf, bView);
+        $("pdfFrame").src = purl; $("pdfFrame").hidden = false;
+      }
       [["photo", j.photo], ["qr", j.qr], ["front", j.front], ["back", j.back]].forEach(([label, b64]) => {
         if (!b64) return;
         const src = String(b64).startsWith("data:") ? b64 : "data:image/png;base64," + b64;
@@ -206,7 +215,7 @@ async function verify() {
       const url = URL.createObjectURL(blob);
       const aDl = document.createElement("a"); aDl.className = "btn2"; aDl.href = url; aDl.download = (j.name || "fayda") + ".json"; aDl.textContent = "⬇ Download JSON";
       $("dl").append(aDl, pre);
-      setStatus("s2status", "User data (JSON) for " + (j.name || "result") + ".", "ok");
+      setStatus("s2status", (format === "pdf_json" ? "PDF + JSON" : "User data (JSON)") + " for " + (j.name || "result") + ".", "ok");
     } else {
       const j = await r.json();
       if (!j.ok) return setStatus("s2status", "Error: " + j.error, "err");

@@ -12,11 +12,12 @@ cost/stability).
 1. `POST /api/session` `{ individualId }` → sends the Server-3 OTP, returns a
    `sessionId` (+ masked phone/email). Billing/limits are pre-checked.
 2. `POST /api/session/:id/verify` `{ otp, format }` → verifies the OTP and
-   renders **in the same process**. `format` ∈ `pdf` | `screenshot` | `json`.
+   renders **in the same process**. `format` ∈ `pdf` | `screenshot` | `json` | `pdf_json`.
    One render per verify; the session is consumed.
    - `pdf` → `application/pdf` bytes (rendered to a Buffer — never touches disk)
    - `screenshot` → JSON with base64 images (in memory)
    - `json` → decoded ID fields + photo/qr/front/back
+   - `pdf_json` → the `json` payload **plus** a `pdf` object `{ filename, contentType, base64 }`
 
 `GET /api/health` reports service/db/bot status.
 
@@ -26,9 +27,18 @@ cost/stability).
 - **prepaid** — balance must cover the price
 - **postpaid** — owed vs credit limit
 
-Charged once per successful verify. A **Telegram admin bot** (polling) manages
-users: approve, issue/revoke keys, limits, billing, counter save & reset, free
-tester key.
+Charged once per successful verify. Each user has a **debt** = current period ×
+price + unpaid saved payments. "Save & reset" freezes a period into a payment
+record (price + amount, paid/unpaid).
+
+A **Telegram admin bot** (polling) manages users: approve, issue/revoke keys,
+limits, billing (price / postpaid limit / add balance via manual entry), counter
+save & reset, **mark payments paid**, free tester key. Destructive actions
+(revoke, clear save, settle, mark-paid) ask for confirmation.
+
+Users can **Add Balance** (notifies admin) and **Pay Debt** — pay all or a single
+unpaid payment by submitting a **receipt** (text / photo / PDF) that an admin
+**Approves** or **Rejects**.
 
 ## Run
 

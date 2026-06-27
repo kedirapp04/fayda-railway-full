@@ -67,6 +67,38 @@ async function init() {
     CREATE INDEX IF NOT EXISTS idx_saves_user ON counter_saves(user_id);
   `);
 
+  // A saved period is also a payment record: freeze the price at save time and
+  // the resulting amount (saved_count × price), with a paid/unpaid flag the
+  // admin can toggle. Idempotent — safe to run on every boot.
+  await pool.query(`
+    ALTER TABLE counter_saves ADD COLUMN IF NOT EXISTS price   DOUBLE PRECISION NOT NULL DEFAULT 0;
+    ALTER TABLE counter_saves ADD COLUMN IF NOT EXISTS amount  DOUBLE PRECISION NOT NULL DEFAULT 0;
+    ALTER TABLE counter_saves ADD COLUMN IF NOT EXISTS paid    SMALLINT NOT NULL DEFAULT 0;
+    ALTER TABLE counter_saves ADD COLUMN IF NOT EXISTS paid_at TEXT;
+  `);
+
+  // A user-submitted payment proof awaiting admin review. scope='all' settles
+  // every unpaid save on approve; scope='one' settles the single save_id. The
+  // receipt is a transaction text and/or a Telegram file_id (photo/PDF).
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS payment_requests (
+      id              INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+      user_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      scope           TEXT NOT NULL,
+      save_id         INTEGER,
+      amount          DOUBLE PRECISION NOT NULL DEFAULT 0,
+      receipt_kind    TEXT,
+      receipt_text    TEXT,
+      receipt_file_id TEXT,
+      status          TEXT NOT NULL DEFAULT 'pending',
+      created_at      TEXT NOT NULL,
+      decided_at      TEXT,
+      decided_by      TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_payreq_user ON payment_requests(user_id);
+    ALTER TABLE payment_requests ENABLE ROW LEVEL SECURITY;
+  `);
+
   // Lock the public schema against Supabase's auto-exposed PostgREST API. With
   // RLS enabled and NO policies, the anon/authenticated REST roles get zero
   // access. The app connects as the `postgres` role (BYPASSRLS), so it is
