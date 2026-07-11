@@ -50,6 +50,54 @@ function fetchJson(url, opts = {}) {
   });
 }
 
+// Append/replace ?min_seconds=N on the pool /token URL so the pool hands out a
+// token with at least N seconds of life (survives the send-OTP→verify→callback
+// window). Malformed URL → returned unchanged.
+function withMinSeconds(url, minSeconds) {
+  const n = Number(minSeconds);
+  if (!Number.isFinite(n) || n <= 0) return url;
+  try {
+    const u = new URL(url);
+    u.searchParams.set("min_seconds", String(Math.floor(n)));
+    return u.toString();
+  } catch (_) {
+    return url;
+  }
+}
+
+/**
+ * Take ONE fresh single-use App Check token from the pool's consuming
+ * `GET /token` endpoint, right before a gated upstream request. App Check tokens
+ * are single-use — never cache or reuse the result. On pool empty / CSRF-401 /
+ * network error, returns `staticFallback` (the admin-pasted token) so the flow
+ * degrades instead of dying. Returns "" if neither is available.
+ *
+ * @param {number} [minSeconds]      minimum life required (default env or 90)
+ * @param {string} [staticFallback]  admin-set token to use if the pool fails
+ * @param {object} [opts]            { apiUrl, csrfToken }
+ * @returns {Promise<string>}
+ */
+async function takeFreshAppCheckToken(minSeconds, staticFallback = "", opts = {}) {
+  const fallback = String(staticFallback || "").trim();
+  const poolUrl = opts.apiUrl || process.env.SERVER4_TOKEN_API_URL || DEFAULT_API_URL;
+  const csrf = opts.csrfToken || process.env.SERVER4_TOKEN_API_CSRF || process.env.XCSRF_TOKEN || "";
+  // Pool not configured (no CSRF) → static token only.
+  if (!String(csrf).trim()) return fallback;
+  const secs = Number.isFinite(Number(minSeconds))
+    ? Number(minSeconds)
+    : Number(process.env.SERVER4_TOKEN_MIN_SECONDS || 90);
+  try {
+    const data = await fetchJson(withMinSeconds(poolUrl, secs), { csrfToken: csrf });
+    const status = data && data.status ? String(data.status).toLowerCase() : "";
+    const usable = !status || status === "active" || status === "warning";
+    const fetched = usable ? String((data && (data.token || data.value)) || "").trim() : "";
+    return fetched || fallback;
+  } catch (_) {
+    // pool empty / csrf rejected / network — degrade to the static token
+    return fallback;
+  }
+}
+
 // Decode the JWT `exp` claim (ms epoch). null if absent/invalid.
 function tokenExp(token) {
   try {
@@ -122,4 +170,4 @@ function startServer4TokenAutoUpdate({ getCurrentToken, setToken, apiUrl, interv
   };
 }
 
-module.exports = { startServer4TokenAutoUpdate, tokenExp, fetchJson, DEFAULT_API_URL };
+module.exports = { startServer4TokenAutoUpdate, takeFreshAppCheckToken, tokenExp, fetchJson, DEFAULT_API_URL };

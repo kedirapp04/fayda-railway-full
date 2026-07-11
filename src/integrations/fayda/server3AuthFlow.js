@@ -825,72 +825,85 @@ async function exchangeServerThreeAuthorizationCode(code, debug = null) {
 // so oauth-details (which reads them off the URL) matches OUR verifier at the
 // Phase 3 callback. If App Check is missing/invalid the GET 401s, so we fall
 // back to the Server-3 legacy authorize (backend PKCE, legacy ?code= callback).
-async function getServerFourAuthorizeUrl({ appCheckToken = null, debug = null } = {}) {
+// ── Server 4 authorize-URL template cache (token optimization) ───────────────
+// The authorize response is STATIC OAuth client config; the per-user
+// code_challenge/state are stamped on client-side (below), so the App Check token
+// spent on authorize buys nothing per user. So ONE token fetches the authorize
+// template, cached for SERVER4_AUTHORIZE_CACHE_MS; every request inside the window
+// is served that cached template stamped with its OWN fresh PKCE → zero tokens for
+// authorize. The per-request token is then spent only at the Phase-3 callback.
+// Kill switch: SERVER4_AUTHORIZE_CACHE_MS=0.
+let _s4AuthorizeCache = { url: null, at: 0 };
+function s4AuthorizeCacheTtlMs() {
+  const v = Number(process.env.SERVER4_AUTHORIZE_CACHE_MS);
+  return Number.isFinite(v) ? v : 10 * 60 * 1000;
+}
+function getServer4AuthorizeCacheInfo() {
+  const ttl = s4AuthorizeCacheTtlMs();
+  const age = _s4AuthorizeCache.url ? Date.now() - _s4AuthorizeCache.at : null;
+  return { cached: Boolean(_s4AuthorizeCache.url), ageMs: age, ttlMs: ttl, fresh: Boolean(_s4AuthorizeCache.url) && age != null && age < ttl };
+}
+function clearServer4AuthorizeCache() { _s4AuthorizeCache = { url: null, at: 0 }; }
+function applyServerFourPkce(templateUrl, pkce, state) {
+  try {
+    const u = new URL(templateUrl);
+    u.searchParams.set("code_challenge", pkce.codeChallenge);
+    u.searchParams.set("code_challenge_method", "S256");
+    u.searchParams.set("state", state);
+    return u.toString();
+  } catch (_) {
+    return templateUrl;
+  }
+}
+
+// takeToken(): async () => fresh single-use App Check token (may throw to abort).
+// Falls back to the static appCheckToken when no taker is supplied.
+async function getServerFourAuthorizeUrl({ takeToken = null, appCheckToken = null, debug = null } = {}) {
   const config = getConfig();
   const pkce = generatePkce();
   const state = randomState();
+  const ttl = s4AuthorizeCacheTtlMs();
+
+  // Cache hit → serve the template with THIS request's PKCE. Zero tokens spent.
+  if (ttl > 0 && _s4AuthorizeCache.url && (Date.now() - _s4AuthorizeCache.at) < ttl) {
+    pushDebug(debug, { type: "info", label: "server4-authorize-cached", note: `served cached authorize template (age ${Math.round((Date.now() - _s4AuthorizeCache.at) / 1000)}s) — 0 tokens` });
+    return { authorizeUrl: applyServerFourPkce(_s4AuthorizeCache.url, pkce, state), pkce, state, mode: "v119", cached: true };
+  }
+
+  // Cache miss → ONE fresh single-use App Check token refreshes the template.
+  const tok = takeToken ? await takeToken() : resolveServer4AppCheck(appCheckToken);
   const url =
     config.faydaApiBase +
     "/api/v2/auth/authorize" +
     `?codeChallenge=${encodeURIComponent(pkce.codeChallenge)}` +
     `&state=${encodeURIComponent(state)}`;
-
   const headers = buildBackendHeaders(
     config.backendUseApiKey === "never" ? null : config.apiKey,
     config.minimalBackendHeaders
   );
-  const tok = resolveServer4AppCheck(appCheckToken);
   if (tok) headers["X-Firebase-AppCheck"] = tok;
 
   try {
-    pushDebug(debug, {
-      type: "request",
-      label: "server4-authorize-v119",
-      request: { method: "GET", url, headers, data: null }
-    });
+    pushDebug(debug, { type: "request", label: "server4-authorize-v119", request: { method: "GET", url, headers, data: null } });
     const response = await backendNativeRequest("GET", url, { headers, timeoutMs: config.timeoutMs });
-    pushDebug(debug, {
-      type: "response",
-      label: "server4-authorize-v119",
-      response: { status: response.status, statusText: response.statusText, headers: response.headers || {}, data: response.data }
-    });
+    pushDebug(debug, { type: "response", label: "server4-authorize-v119", response: { status: response.status, statusText: response.statusText, headers: response.headers || {}, data: response.data } });
 
-    let authorizeUrl = rewriteAuthorizeUrl(extractAuthorizeUrl(response.data), debug);
-    // Force OUR PKCE challenge + state onto the returned link (mirrors bothfile.js).
-    try {
-      const parsed = new URL(authorizeUrl);
-      parsed.searchParams.set("code_challenge", pkce.codeChallenge);
-      parsed.searchParams.set("code_challenge_method", "S256");
-      parsed.searchParams.set("state", state);
-      authorizeUrl = parsed.toString();
-    } catch (_) {
-      // keep the raw URL if it is not parseable
+    // Cache the raw template (the eSignet link BEFORE our per-request PKCE stamp).
+    const template = rewriteAuthorizeUrl(extractAuthorizeUrl(response.data), debug);
+    if (ttl > 0) {
+      _s4AuthorizeCache = { url: template, at: Date.now() };
+      pushDebug(debug, { type: "info", label: "server4-authorize-refresh", note: `authorize template refreshed (1 token) — cached ${Math.round(ttl / 60000)}m` });
     }
-    return { authorizeUrl, pkce, state, mode: "v119" };
+    return { authorizeUrl: applyServerFourPkce(template, pkce, state), pkce, state, mode: "v119", cached: false };
   } catch (error) {
-    // If we DID send a token and Fayda still rejected it, that's a token problem
-    // (invalid/expired) — surface it directly. Don't mask it with the legacy
-    // (no-token) authorize, which Fayda now also gates behind App Check (it would
-    // turn a clear "invalid token" into a confusing "App Check token required").
     if (tok) {
-      pushDebug(debug, {
-        type: "info",
-        label: "server4-authorize-token-rejected",
-        note: "v1.1.9 authorize rejected the supplied App Check token (likely expired/invalid) — refresh it",
-        error: error?.message || String(error)
-      });
+      pushDebug(debug, { type: "info", label: "server4-authorize-token-rejected", note: "v1.1.9 authorize rejected the App Check token (expired/invalid)", error: error?.message || String(error) });
       const e = new Error("App Check token was rejected by Fayda (expired or invalid). Refresh the Server 4 token.");
       e.response = error?.response;
       e.appCheckRejected = true;
       throw e;
     }
-    // No token was supplied — fall back to the legacy Server-3 authorize.
-    pushDebug(debug, {
-      type: "info",
-      label: "server4-authorize-fallback",
-      note: "No App Check token supplied; falling back to Server-3 authorize",
-      error: error?.message || String(error)
-    });
+    pushDebug(debug, { type: "info", label: "server4-authorize-fallback", note: "No App Check token supplied; falling back to Server-3 authorize", error: error?.message || String(error) });
     const authorizeUrl = await getServerThreeAuthorizeUrl(debug);
     return { authorizeUrl, pkce: null, state: null, mode: "legacy" };
   }
@@ -942,16 +955,19 @@ async function exchangeServerFourCallback({ code, codeVerifier = null, state = n
 
 async function sendServerFourOtp(individualId, options = {}) {
   const debug = options.debug || options.debugEvents || null;
+  const takeToken = options.takeToken || null;
   const appCheckToken = options.appCheckToken || null;
   const config = getConfig();
 
-  const authorize = await getServerFourAuthorizeUrl({ appCheckToken, debug });
+  const authorize = await getServerFourAuthorizeUrl({ takeToken, appCheckToken, debug });
   const session = await initializeServerThreeSession(authorize.authorizeUrl, debug);
-  // Carry the v1.1.9 PKCE + state + token through to the Phase 3 callback.
+  // Carry the v1.1.9 PKCE + state through to the Phase 3 callback. The App Check
+  // token is NOT carried: the callback takes its own fresh single-use token
+  // (tokens are single-use — reuse → APP_CHECK_REPLAY).
   session.pkce = authorize.pkce || null;
   session.callbackState = authorize.state || null;
   session.callbackMode = authorize.mode === "v119" ? "body" : "legacy";
-  session.appCheckToken = appCheckToken || null;
+  session.appCheckToken = null;
 
   const jar = new CookieJar(session.cookies);
   const client = axios.create({
@@ -988,11 +1004,13 @@ async function sendServerFourOtp(individualId, options = {}) {
   };
 }
 
-async function authenticateServerFourOtp({ otp, individualId, authSession, appCheckToken = null, debug = null }) {
+async function authenticateServerFourOtp({ otp, individualId, authSession, takeToken = null, appCheckToken = null, debug = null }) {
   const { codePayload, authPayload } = await runEsignetAuthenticate({ otp, individualId, authSession, debug });
 
   const useBodyCallback = authSession.callbackMode !== "legacy" && authSession.pkce;
-  const token = appCheckToken || authSession.appCheckToken || null;
+  // The callback is where the token is actually spent (App Check tokens are
+  // single-use). Take a FRESH one here rather than reusing the authorize token.
+  const token = takeToken ? await takeToken() : (appCheckToken || authSession.appCheckToken || null);
 
   let callbackResponse;
   if (useBodyCallback) {
@@ -1026,7 +1044,9 @@ module.exports = {
   exchangeServerThreeAuthorizationCode,
   sendServerFourOtp,
   authenticateServerFourOtp,
-  exchangeServerFourCallback
+  exchangeServerFourCallback,
+  getServer4AuthorizeCacheInfo,
+  clearServer4AuthorizeCache
 };
 
 

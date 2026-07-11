@@ -5,6 +5,7 @@ const {
   sendServerFourOtp,
   authenticateServerFourOtp
 } = require("../integrations/fayda/server3AuthFlow");
+const { takeFreshAppCheckToken } = require("../services/server4TokenUpdater");
 const { createSession, getSession, deleteSession } = require("../services/otpSession.service");
 const { maskFan } = require("../utils/crypto");
 const store = require("../services/store.service");
@@ -25,6 +26,23 @@ const FORMAT_ALIASES = {
 
 // Image keys live in their own response fields; everything else goes under `data`.
 const JSON_IMG_KEYS = ["photo", "QRCodes", "qrCodes", "qrCode", "fronts", "front", "backs", "back"];
+
+// The Server-4 token pool is "configured" once a CSRF is set (the URL always has
+// a default). When it is, every gated request takes a FRESH single-use token from
+// the pool (App Check tokens are single-use — reuse → APP_CHECK_REPLAY), falling
+// back to the admin-pasted static token if the pool is empty/unreachable.
+function server4PoolConfigured() {
+  return Boolean(String(process.env.SERVER4_TOKEN_API_CSRF || process.env.XCSRF_TOKEN || "").trim());
+}
+function server4MinSeconds() {
+  return Number(process.env.SERVER4_TOKEN_MIN_SECONDS || 90);
+}
+// Build a takeToken() the auth flow calls right before each gated request.
+// Returns null when the pool is off → the flow uses the static `staticFallback`.
+function makeServer4TokenTaker(staticFallback) {
+  if (!server4PoolConfigured()) return null;
+  return () => takeFreshAppCheckToken(server4MinSeconds(), staticFallback);
+}
 
 function httpError(status, message) {
   const err = new Error(message);
@@ -104,18 +122,24 @@ async function startSession(req, res, next) {
     // to the Server-4 flow so the token is sent. Server 3 is used only when no
     // token is set, or it is explicitly requested with server=server3.
     const appCheckToken = await store.getServer4Token();
+    // The pool alone can drive Server 4 even with no static token pasted.
+    const poolConfigured = server4PoolConfigured();
     const serverChoice = String(req.body?.server || "").toLowerCase().replace(/[\s._-]/g, "");
     const explicitS3 = ["server3", "3", "esignet", "v117"].includes(serverChoice);
     const explicitS4 = ["server4", "4", "v119", "faydaapp", "appcheck"].includes(serverChoice);
-    const useServer4 = explicitS4 || (!explicitS3 && Boolean(appCheckToken));
+    const useServer4 = explicitS4 || (!explicitS3 && (Boolean(appCheckToken) || poolConfigured));
 
     let result;
     try {
       if (useServer4) {
-        if (!appCheckToken) {
-          throw httpError(503, "Server 4 needs an App Check token. A super-admin must set it with /server4token in the bot.");
+        if (!appCheckToken && !poolConfigured) {
+          throw httpError(503, "Server 4 needs an App Check token. A super-admin must set it with /server4token in the bot, or configure the token pool.");
         }
-        result = await sendServerFourOtp(individualId, { appCheckToken });
+        // Fresh single-use token per request from the pool (static token = fallback).
+        result = await sendServerFourOtp(individualId, {
+          takeToken: makeServer4TokenTaker(appCheckToken),
+          appCheckToken
+        });
       } else {
         result = await sendServerThreeOtp(individualId);
       }
@@ -174,12 +198,15 @@ async function verifyAndGenerate(req, res, next) {
     const isServer4 = session.server === "server4";
     let verifyResponse;
     try {
+      const s4Static = isServer4 ? await store.getServer4Token() : null;
       verifyResponse = isServer4
         ? await authenticateServerFourOtp({
             otp,
             individualId: session.individualId,
             authSession: session.authSession,
-            appCheckToken: await store.getServer4Token()
+            // The callback is where the token is actually spent — take a FRESH one.
+            takeToken: makeServer4TokenTaker(s4Static),
+            appCheckToken: s4Static
           })
         : await authenticateServerThreeOtp({
             otp,
