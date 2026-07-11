@@ -168,7 +168,7 @@ function startServer4TokenAutoUpdate(_opts = {}) {
   // every poll — and a single stored token can't stand in for the pool anyway
   // (it would replay). The only token source is the pool (which needs a CSRF),
   // so there is nothing to refresh without one. Retained as a no-op so callers
-  // keep working. To set a manual break-glass token, paste it with /server4token.
+  // keep working.
   return { stop() {} };
 }
 

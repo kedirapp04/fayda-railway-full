@@ -34,15 +34,6 @@ const pendingInput = new Map();
 // when a user taps Pay All / Pay #id; consumed by the message handler when they
 // send the receipt (text, photo, or PDF).
 const pendingReceipt = new Map();
-
-// Server 4 App Check token status, from the decoded JWT `exp` (real expiry).
-function s4StatusLine(info) {
-  if (!info.set) return "❌ Empty (Server 4 falls back to Server 3)";
-  if (info.minLeft == null) return `✅ Set (${info.preview}) · no exp in token`;
-  return info.minLeft > 0
-    ? `✅ Set (${info.preview}) · expires in ${info.minLeft} min`
-    : `⚠️ EXPIRED ${Math.abs(info.minLeft)} min ago (${info.preview}) — refresh it`;
-}
 const TESTER_PATH = path.join(__dirname, "..", "..", "tester.html");
 const DOCS_PATH = path.join(__dirname, "..", "..", "userusage.md");
 
@@ -129,30 +120,28 @@ async function userMenu(u, viewerIsAdmin) {
 }
 
 async function adminPanel() {
-  const s4 = await store.getServer4TokenInfo();
   const csrf = await store.getServer4CsrfInfo();
   return { reply_markup: { inline_keyboard: [
     [{ text: "⏳ Pending", callback_data: "a:pending" }, { text: "👥 Users", callback_data: "a:users" }],
     [{ text: `🌐 Global price: ${await store.globalPrice()}`, callback_data: "a:gprice" }],
-    [{ text: "🎫 Tokens", callback_data: "a:tokens" }],
-    [{ text: `🔑 S4 token: ${s4.set ? "set" : "empty"}`, callback_data: "a:s4token" },
+    [{ text: "🎫 Tokens", callback_data: "a:tokens" },
      { text: `🔐 CSRF: ${csrf.set ? csrf.source : "empty"}`, callback_data: "a:s4csrf" }],
     [{ text: "🔄 Refresh", callback_data: "a:panel" }]
   ] } };
 }
 
 // 🎫 Tokens dashboard — live pool count (non-consuming), authorize-cache state,
-// static fallback + CSRF status, in-memory usage counters, and recent events.
+// CSRF status, in-memory usage counters, and recent events. Pool-only: no static
+// token, so every Server-4 request draws its own fresh single-use token.
 async function tokensDashboard() {
   const csrf = await store.getServer4CsrfInfo();
-  const s4 = await store.getServer4TokenInfo();
   const cache = getServer4AuthorizeCacheInfo();
   const m = tokenMetrics.snapshot(12);
   const c = m.counters;
 
   let poolLine;
   if (!csrf.set) {
-    poolLine = "⚪ Pool: no CSRF set — pool disabled (static token only)";
+    poolLine = "⚪ Pool: no CSRF set — Server 4 disabled (set it with /server4csrf)";
   } else {
     const avail = await getPoolAvailable({ csrfToken: await store.getServer4Csrf() });
     poolLine = avail.ok
@@ -169,10 +158,9 @@ async function tokensDashboard() {
     : "(no token events yet)";
 
   const text =
-    "🎫 Token dashboard\n" +
+    "🎫 Token dashboard (pool-only)\n" +
     `${poolLine}\n` +
     `🔐 CSRF: ${csrf.set ? `${csrf.source}${csrf.preview ? " · " + csrf.preview : ""}` : "empty"}\n` +
-    `🔑 Static fallback: ${csrf.set ? "not used (pool-only)" : s4StatusLine(s4)}\n` +
     `${cacheLine}\n\n` +
     "📊 Since restart:\n" +
     `• takes ok: ${c.takesOk} (callback ${c.callbackTakes})\n` +
@@ -182,7 +170,7 @@ async function tokensDashboard() {
 
   return { text, markup: { reply_markup: { inline_keyboard: [
     [{ text: "🔄 Refresh", callback_data: "a:tokens" }],
-    [{ text: "🔐 Set CSRF", callback_data: "a:s4csrf" }, { text: "🔑 Set token", callback_data: "a:s4token" }],
+    [{ text: "🔐 Set CSRF", callback_data: "a:s4csrf" }],
     [{ text: "⬅ Panel", callback_data: "a:panel" }]
   ] } } };
 }
@@ -323,10 +311,9 @@ function start() {
   ]).catch(() => {});
   bot.setChatMenuButton({ menu_button: { type: "commands" } }).catch(() => {});
 
-  // No background token refresh: pool mode draws a fresh single-use token per
-  // request, so there is no static token to keep warm (a background refresher
-  // would only drain the pool). A manual break-glass token can still be pasted
-  // with /server4token for the non-pool fallback path.
+  // No background token refresh and no static token: Server 4 is pool-only, so
+  // every request draws its own fresh single-use token from the pool. The pool
+  // CSRF is set with /server4csrf.
 
   const openMenu = async (msg) => {
     if (!requireUsername(msg.from, msg.chat.id)) return;
@@ -350,23 +337,6 @@ function start() {
   bot.onText(/^\/gprice\s+([\d.]+)/, async (msg, m) => {
     if (!isAdmin(msg.from.id)) return;
     bot.sendMessage(msg.chat.id, `🌐 Global price → ${await store.setGlobalPrice(m[1])}`);
-  });
-  // ── Server 4 (Fayda app v1.1.9) App Check token (admin/super-admin) ──
-  // `/server4token <jwt>` sets it; `/server4token` alone shows status. The
-  // token is short-lived (~1h); refresh it here when Server 4 starts failing.
-  bot.onText(/^\/server4token(?:\s+(\S+))?\s*$/, async (msg, m) => {
-    if (!isAdmin(msg.from.id)) return;
-    const token = (m[1] || "").trim();
-    if (!token) {
-      const info = await store.getServer4TokenInfo();
-      return bot.sendMessage(msg.chat.id,
-        `🔑 Server 4 App Check token: ${s4StatusLine(info)}\n\nTo update, send:\n\`/server4token <token>\`\n\nThe token is a device X-Firebase-AppCheck JWT, valid ~1 hour.`,
-        { parse_mode: "Markdown" });
-    }
-    await store.setServer4Token(token);
-    // Remove the pasted token from the chat history for hygiene.
-    bot.deleteMessage(msg.chat.id, msg.message_id).catch(() => {});
-    bot.sendMessage(msg.chat.id, `✅ Server 4 App Check token updated.\n${s4StatusLine(await store.getServer4TokenInfo())}`);
   });
   // ── Server 4 token-pool X-CSRF-Token (admin). `/server4csrf <token>` sets it,
   // `/server4csrf` alone shows status, `/server4csrf clear` reverts to .env. ──
@@ -617,14 +587,6 @@ function start() {
           const owner = await store.getUserById(ownerId);
           if (owner) { const sm = await adminSavesMenu(owner); return edit(sm.text, sm.markup); }
           return edit("🛠 Admin Panel", await adminPanel());
-        }
-        if (action === "s4token") {
-          ack();
-          const info = await store.getServer4TokenInfo();
-          return edit(
-            `🔑 Server 4 App Check token\n${s4StatusLine(info)}\n\nTo update, send a message:\n/server4token <token>\n\nDevice X-Firebase-AppCheck JWT, valid ~1 hour.`,
-            { reply_markup: { inline_keyboard: [[{ text: "🎫 Tokens", callback_data: "a:tokens" }], [{ text: "⬅ Panel", callback_data: "a:panel" }]] } }
-          );
         }
         if (action === "tokens") { ack(); const view = await tokensDashboard(); return edit(view.text, view.markup); }
         if (action === "s4csrf") {

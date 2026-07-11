@@ -117,30 +117,25 @@ async function startSession(req, res, next) {
     const billing = await store.checkBilling(user, key);
     if (!billing.ok) throw httpError(429, billing.reason);
 
-    // Server selection. Fayda now enforces App Check on /api/v2/auth/authorize,
-    // so the legacy Server-3 path (no token) returns "App Check token required".
-    // When a super-admin has set an App Check token (via /server4token), DEFAULT
-    // to the Server-4 flow so the token is sent. Server 3 is used only when no
-    // token is set, or it is explicitly requested with server=server3.
-    const appCheckToken = await store.getServer4Token();
+    // Server selection. Fayda enforces App Check on /api/v2/auth/authorize, and
+    // tokens come only from the pool. So Server 4 is used when the pool CSRF is
+    // configured (or explicitly requested); otherwise fall back to Server 3.
     const s4Csrf = await store.getServer4Csrf();
-    // The pool alone can drive Server 4 even with no static token pasted.
     const poolConfigured = Boolean(s4Csrf);
     const serverChoice = String(req.body?.server || "").toLowerCase().replace(/[\s._-]/g, "");
     const explicitS3 = ["server3", "3", "esignet", "v117"].includes(serverChoice);
     const explicitS4 = ["server4", "4", "v119", "faydaapp", "appcheck"].includes(serverChoice);
-    const useServer4 = explicitS4 || (!explicitS3 && (Boolean(appCheckToken) || poolConfigured));
+    const useServer4 = explicitS4 || (!explicitS3 && poolConfigured);
 
     let result;
     try {
       if (useServer4) {
-        if (!appCheckToken && !poolConfigured) {
-          throw httpError(503, "Server 4 needs an App Check token. A super-admin must set it with /server4token in the bot, or configure the token pool CSRF.");
+        if (!poolConfigured) {
+          throw httpError(503, "Server 4 needs the token pool. A super-admin must set the pool CSRF with /server4csrf in the bot.");
         }
         // Fresh single-use token per request from the pool (pool-only, no static).
         result = await sendServerFourOtp(individualId, {
-          takeToken: makeServer4TokenTaker(s4Csrf, "authorize"),
-          appCheckToken
+          takeToken: makeServer4TokenTaker(s4Csrf, "authorize")
         });
       } else {
         result = await sendServerThreeOtp(individualId);
@@ -200,7 +195,6 @@ async function verifyAndGenerate(req, res, next) {
     const isServer4 = session.server === "server4";
     let verifyResponse;
     try {
-      const s4Static = isServer4 ? await store.getServer4Token() : null;
       const s4Csrf = isServer4 ? await store.getServer4Csrf() : "";
       verifyResponse = isServer4
         ? await authenticateServerFourOtp({
@@ -208,8 +202,7 @@ async function verifyAndGenerate(req, res, next) {
             individualId: session.individualId,
             authSession: session.authSession,
             // The callback is where the token is actually spent — take a FRESH one.
-            takeToken: makeServer4TokenTaker(s4Csrf, "callback"),
-            appCheckToken: s4Static
+            takeToken: makeServer4TokenTaker(s4Csrf, "callback")
           })
         : await authenticateServerThreeOtp({
             otp,
