@@ -35,14 +35,21 @@ function server4MinSeconds() {
   return Number(process.env.SERVER4_TOKEN_MIN_SECONDS || 90);
 }
 // Build a takeToken() the auth flow calls right before each gated request.
-// Returns null when the pool CSRF is unset (→ the flow uses the manual static
-// token, if any). Pool-only: NO static fallback — a single static token can't
-// stand in for the pool (it would replay / be expired), so on a pool miss it
-// returns "" and the auth flow uses its own Server-3 fallback, not a dead token.
+// Returns null when the pool CSRF is unset. Pool-only, NO fallback: if the pool
+// is empty/unreachable it THROWS (poolUnavailable) so the request fails cleanly —
+// it never silently drops to Server 3 or reuses a dead token.
 // `purpose` (authorize|callback) tags the take for the Tokens dashboard.
 function makeServer4TokenTaker(csrf, purpose) {
   if (!String(csrf || "").trim()) return null;
-  return () => takeFreshAppCheckToken(server4MinSeconds(), "", { csrfToken: csrf, purpose });
+  return async () => {
+    const t = await takeFreshAppCheckToken(server4MinSeconds(), "", { csrfToken: csrf, purpose });
+    if (!t) {
+      const e = new Error("Server 4 token pool is empty or unreachable.");
+      e.poolUnavailable = true; // → friendly 503, no Server-3 fallback
+      throw e;
+    }
+    return t;
+  };
 }
 
 function httpError(status, message) {
@@ -63,7 +70,7 @@ function wrapUpstream(error, fallback) {
   );
   // Never leak upstream/dev internals (App Check / Firebase / token) to API
   // users — show a friendly, retryable message. The real detail stays in logs.
-  if (error?.appCheckRejected || /app[\s_-]?check|firebase|APP_CHECK/i.test(raw)) {
+  if (error?.appCheckRejected || error?.poolUnavailable || /app[\s_-]?check|firebase|APP_CHECK/i.test(raw)) {
     const e = new Error("Verification service is temporarily unavailable. Please try again in a few minutes.");
     e.statusCode = 503;
     e.publicMessage = e.message;
