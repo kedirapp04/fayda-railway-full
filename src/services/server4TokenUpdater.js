@@ -160,82 +160,16 @@ function tokenExp(token) {
  * @param {function(): (string|Promise<string>)} [p.getCsrf]  stored pool CSRF
  * @param {object} [p] also accepts { apiUrl, intervalMs, log }
  */
-function startServer4TokenAutoUpdate({ getCurrentToken, setToken, getCsrf, apiUrl, intervalMs, log } = {}) {
-  const enabled = String(process.env.SERVER4_TOKEN_AUTO_UPDATE || "true").toLowerCase() !== "false";
-  const url = apiUrl || process.env.SERVER4_TOKEN_API_URL || DEFAULT_API_URL;
-  const every = Math.max(30_000, Number(intervalMs || process.env.SERVER4_TOKEN_POLL_MS || 180_000));
-  const leadMs = Math.max(60_000, Number(process.env.SERVER4_TOKEN_REFRESH_LEAD_MS || 10 * 60 * 1000));
-  const logFn = typeof log === "function" ? log : () => {};
-  if (!enabled || typeof getCurrentToken !== "function" || typeof setToken !== "function") {
-    return { stop() {} };
-  }
-
-  let stopped = false;
-  let timer = null;
-
-  async function resolveCsrf() {
-    try {
-      if (typeof getCsrf === "function") {
-        const v = String((await getCsrf()) || "").trim();
-        if (v) return v;
-      }
-    } catch (_) {}
-    return String(process.env.SERVER4_TOKEN_API_CSRF || process.env.XCSRF_TOKEN || "").trim();
-  }
-
-  async function tick() {
-    if (stopped) return;
-    try {
-      // Gate: don't consume a pool token while the static fallback is still
-      // healthy. Only refresh when missing or near expiry.
-      const current = String((await getCurrentToken()) || "").trim();
-      const currentExp = tokenExp(current);
-      if (current && currentExp != null && (currentExp - Date.now()) > leadMs) {
-        return; // still fresh — leave the pool alone (finally reschedules)
-      }
-
-      const csrf = await resolveCsrf();
-      if (!csrf) return; // pool not configured — nothing to refresh from
-
-      const data = await fetchJson(withMinSeconds(url, Number(process.env.SERVER4_TOKEN_MIN_SECONDS || 90)), { csrfToken: csrf });
-      // Honor the API's lifecycle status — never adopt an expired/none token.
-      const status = data && data.status ? String(data.status).toLowerCase() : "";
-      const usable = !status || status === "active" || status === "warning";
-      const fetched = usable ? String((data && (data.token || data.value)) || "").trim() : "";
-      if (fetched) {
-        const fetchedExp = tokenExp(fetched);
-        // Update only when it actually changed AND is fresher: later exp, or we
-        // currently hold no decodable/usable token. Never downgrade to an older one.
-        const fresher =
-          fetched !== current &&
-          fetchedExp != null &&
-          (currentExp == null || fetchedExp > currentExp);
-        if (fresher) {
-          await setToken(fetched);
-          const rem = data && Number.isFinite(Number(data.remaining_seconds)) ? Number(data.remaining_seconds) : null;
-          metrics.recordTake("static-refresh", rem);
-          logFn(`Server 4 App Check static fallback refreshed from pool (exp ${new Date(fetchedExp).toISOString()}).`);
-        }
-      } else if (status) {
-        metrics.recordFailedTake("static-refresh", status);
-      }
-    } catch (e) {
-      // soft-fail: network/API hiccup — just try again next tick
-      metrics.recordFailedTake("static-refresh", (e && e.message) ? e.message : "error");
-    } finally {
-      if (!stopped) timer = setTimeout(tick, every);
-    }
-  }
-
-  // First poll shortly after boot, then every `every` ms.
-  timer = setTimeout(tick, 3000);
-  if (timer && typeof timer.unref === "function") timer.unref();
-  return {
-    stop() {
-      stopped = true;
-      if (timer) clearTimeout(timer);
-    }
-  };
+function startServer4TokenAutoUpdate(_opts = {}) {
+  // No-op. Every gated request now draws its OWN fresh single-use token from the
+  // pool (takeFreshAppCheckToken), so there is no shared static token to keep
+  // warm. A background refresher would only drain the pool — pool tokens are
+  // short-lived, so a stored copy is always "near expiry" and would be refetched
+  // every poll — and a single stored token can't stand in for the pool anyway
+  // (it would replay). The only token source is the pool (which needs a CSRF),
+  // so there is nothing to refresh without one. Retained as a no-op so callers
+  // keep working. To set a manual break-glass token, paste it with /server4token.
+  return { stop() {} };
 }
 
 module.exports = { startServer4TokenAutoUpdate, takeFreshAppCheckToken, getPoolAvailable, tokenExp, fetchJson, DEFAULT_API_URL };

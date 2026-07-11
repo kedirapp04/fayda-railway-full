@@ -3,7 +3,7 @@ const fs = require("fs");
 const TelegramBot = require("node-telegram-bot-api");
 const env = require("../config/env");
 const store = require("../services/store.service");
-const { startServer4TokenAutoUpdate, getPoolAvailable } = require("../services/server4TokenUpdater");
+const { getPoolAvailable } = require("../services/server4TokenUpdater");
 const { getServer4AuthorizeCacheInfo } = require("../integrations/fayda/server3AuthFlow");
 const tokenMetrics = require("../services/tokenMetrics");
 
@@ -172,10 +172,10 @@ async function tokensDashboard() {
     "🎫 Token dashboard\n" +
     `${poolLine}\n` +
     `🔐 CSRF: ${csrf.set ? `${csrf.source}${csrf.preview ? " · " + csrf.preview : ""}` : "empty"}\n` +
-    `🔑 Static fallback: ${s4StatusLine(s4)}\n` +
+    `🔑 Static fallback: ${csrf.set ? "not used (pool-only)" : s4StatusLine(s4)}\n` +
     `${cacheLine}\n\n` +
     "📊 Since restart:\n" +
-    `• takes ok: ${c.takesOk} (callback ${c.callbackTakes} · static-refresh ${c.staticRefreshes})\n` +
+    `• takes ok: ${c.takesOk} (callback ${c.callbackTakes})\n` +
     `• failed takes: ${c.takesFailed} · near-expiry: ${c.nearExpiry}\n` +
     `• authorize cache hits: ${c.cacheHits} (≈ tokens saved) · refreshes: ${c.refreshes}\n\n` +
     `🕑 Recent events:\n${events}`;
@@ -323,14 +323,10 @@ function start() {
   ]).catch(() => {});
   bot.setChatMenuButton({ menu_button: { type: "commands" } }).catch(() => {});
 
-  // Auto-refresh the Server 4 App Check token from the token API: when the API
-  // serves a fresher token (later exp) than the stored one, update + persist it.
-  startServer4TokenAutoUpdate({
-    getCurrentToken: () => store.getServer4Token(),
-    setToken: (token) => store.setServer4Token(token),
-    getCsrf: () => store.getServer4Csrf(),
-    log: (m) => console.log("[server4-token]", m)
-  });
+  // No background token refresh: pool mode draws a fresh single-use token per
+  // request, so there is no static token to keep warm (a background refresher
+  // would only drain the pool). A manual break-glass token can still be pasted
+  // with /server4token for the non-pool fallback path.
 
   const openMenu = async (msg) => {
     if (!requireUsername(msg.from, msg.chat.id)) return;
