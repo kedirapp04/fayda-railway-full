@@ -10,7 +10,11 @@ const http = require("http");
 const https = require("https");
 const metrics = require("./tokenMetrics");
 
-const DEFAULT_API_URL = "http://173.249.21.62:8010/token";
+// Default ntknpro pool host (Contabo VPS). Override with SERVER4_TOKEN_API_URL.
+// Must match the pool your X-CSRF-Token belongs to — a URL/CSRF host mismatch
+// makes every take fail and silently fall back to the static token (which then
+// replays → "Verification service temporarily unavailable").
+const DEFAULT_API_URL = "http://173.212.212.105:8010/token";
 
 // The token API requires an X-CSRF-Token header on /token (HTTP 401 without it).
 // Each approved Telegram user gets theirs from the bot's /csrf command; put it in
