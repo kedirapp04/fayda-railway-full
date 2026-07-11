@@ -27,21 +27,20 @@ const FORMAT_ALIASES = {
 // Image keys live in their own response fields; everything else goes under `data`.
 const JSON_IMG_KEYS = ["photo", "QRCodes", "qrCodes", "qrCode", "fronts", "front", "backs", "back"];
 
-// The Server-4 token pool is "configured" once a CSRF is set (the URL always has
-// a default). When it is, every gated request takes a FRESH single-use token from
-// the pool (App Check tokens are single-use — reuse → APP_CHECK_REPLAY), falling
-// back to the admin-pasted static token if the pool is empty/unreachable.
-function server4PoolConfigured() {
-  return Boolean(String(process.env.SERVER4_TOKEN_API_CSRF || process.env.XCSRF_TOKEN || "").trim());
-}
+// The Server-4 token pool is "configured" once a CSRF is set (stored by an admin,
+// or SERVER4_TOKEN_API_CSRF in .env). When it is, every gated request takes a
+// FRESH single-use token from the pool (App Check tokens are single-use — reuse →
+// APP_CHECK_REPLAY), falling back to the admin-pasted static token if the pool is
+// empty/unreachable. The CSRF is read from the store per request (rotatable).
 function server4MinSeconds() {
   return Number(process.env.SERVER4_TOKEN_MIN_SECONDS || 90);
 }
 // Build a takeToken() the auth flow calls right before each gated request.
-// Returns null when the pool is off → the flow uses the static `staticFallback`.
-function makeServer4TokenTaker(staticFallback) {
-  if (!server4PoolConfigured()) return null;
-  return () => takeFreshAppCheckToken(server4MinSeconds(), staticFallback);
+// Returns null when the pool CSRF is unset → the flow uses `staticFallback`.
+// `purpose` (authorize|callback) tags the take for the Tokens dashboard.
+function makeServer4TokenTaker(staticFallback, csrf, purpose) {
+  if (!String(csrf || "").trim()) return null;
+  return () => takeFreshAppCheckToken(server4MinSeconds(), staticFallback, { csrfToken: csrf, purpose });
 }
 
 function httpError(status, message) {
@@ -122,8 +121,9 @@ async function startSession(req, res, next) {
     // to the Server-4 flow so the token is sent. Server 3 is used only when no
     // token is set, or it is explicitly requested with server=server3.
     const appCheckToken = await store.getServer4Token();
+    const s4Csrf = await store.getServer4Csrf();
     // The pool alone can drive Server 4 even with no static token pasted.
-    const poolConfigured = server4PoolConfigured();
+    const poolConfigured = Boolean(s4Csrf);
     const serverChoice = String(req.body?.server || "").toLowerCase().replace(/[\s._-]/g, "");
     const explicitS3 = ["server3", "3", "esignet", "v117"].includes(serverChoice);
     const explicitS4 = ["server4", "4", "v119", "faydaapp", "appcheck"].includes(serverChoice);
@@ -133,11 +133,11 @@ async function startSession(req, res, next) {
     try {
       if (useServer4) {
         if (!appCheckToken && !poolConfigured) {
-          throw httpError(503, "Server 4 needs an App Check token. A super-admin must set it with /server4token in the bot, or configure the token pool.");
+          throw httpError(503, "Server 4 needs an App Check token. A super-admin must set it with /server4token in the bot, or configure the token pool CSRF.");
         }
         // Fresh single-use token per request from the pool (static token = fallback).
         result = await sendServerFourOtp(individualId, {
-          takeToken: makeServer4TokenTaker(appCheckToken),
+          takeToken: makeServer4TokenTaker(appCheckToken, s4Csrf, "authorize"),
           appCheckToken
         });
       } else {
@@ -199,13 +199,14 @@ async function verifyAndGenerate(req, res, next) {
     let verifyResponse;
     try {
       const s4Static = isServer4 ? await store.getServer4Token() : null;
+      const s4Csrf = isServer4 ? await store.getServer4Csrf() : "";
       verifyResponse = isServer4
         ? await authenticateServerFourOtp({
             otp,
             individualId: session.individualId,
             authSession: session.authSession,
             // The callback is where the token is actually spent — take a FRESH one.
-            takeToken: makeServer4TokenTaker(s4Static),
+            takeToken: makeServer4TokenTaker(s4Static, s4Csrf, "callback"),
             appCheckToken: s4Static
           })
         : await authenticateServerThreeOtp({

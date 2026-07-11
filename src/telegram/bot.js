@@ -3,7 +3,9 @@ const fs = require("fs");
 const TelegramBot = require("node-telegram-bot-api");
 const env = require("../config/env");
 const store = require("../services/store.service");
-const { startServer4TokenAutoUpdate } = require("../services/server4TokenUpdater");
+const { startServer4TokenAutoUpdate, getPoolAvailable } = require("../services/server4TokenUpdater");
+const { getServer4AuthorizeCacheInfo } = require("../integrations/fayda/server3AuthFlow");
+const tokenMetrics = require("../services/tokenMetrics");
 
 let bot = null;
 
@@ -128,12 +130,61 @@ async function userMenu(u, viewerIsAdmin) {
 
 async function adminPanel() {
   const s4 = await store.getServer4TokenInfo();
+  const csrf = await store.getServer4CsrfInfo();
   return { reply_markup: { inline_keyboard: [
     [{ text: "⏳ Pending", callback_data: "a:pending" }, { text: "👥 Users", callback_data: "a:users" }],
     [{ text: `🌐 Global price: ${await store.globalPrice()}`, callback_data: "a:gprice" }],
-    [{ text: `🔑 S4 token: ${s4.set ? "set" : "empty"}`, callback_data: "a:s4token" }],
+    [{ text: "🎫 Tokens", callback_data: "a:tokens" }],
+    [{ text: `🔑 S4 token: ${s4.set ? "set" : "empty"}`, callback_data: "a:s4token" },
+     { text: `🔐 CSRF: ${csrf.set ? csrf.source : "empty"}`, callback_data: "a:s4csrf" }],
     [{ text: "🔄 Refresh", callback_data: "a:panel" }]
   ] } };
+}
+
+// 🎫 Tokens dashboard — live pool count (non-consuming), authorize-cache state,
+// static fallback + CSRF status, in-memory usage counters, and recent events.
+async function tokensDashboard() {
+  const csrf = await store.getServer4CsrfInfo();
+  const s4 = await store.getServer4TokenInfo();
+  const cache = getServer4AuthorizeCacheInfo();
+  const m = tokenMetrics.snapshot(12);
+  const c = m.counters;
+
+  let poolLine;
+  if (!csrf.set) {
+    poolLine = "⚪ Pool: no CSRF set — pool disabled (static token only)";
+  } else {
+    const avail = await getPoolAvailable({ csrfToken: await store.getServer4Csrf() });
+    poolLine = avail.ok
+      ? `${avail.count > 0 ? "🟢" : "⚪"} Pool: ${avail.count == null ? "?" : avail.count} fresh token(s)${avail.soonestSec != null ? ` · soonest ~${Math.round(avail.soonestSec / 60)}m` : ""}`
+      : `🔴 Pool unreachable: ${avail.error}`;
+  }
+
+  const cacheLine = cache.fresh
+    ? `💾 Authorize cache: fresh (age ${Math.round((cache.ageMs || 0) / 1000)}s / ttl ${Math.round(cache.ttlMs / 60000)}m)`
+    : cache.cached ? `💾 Authorize cache: stale — refetches next request` : "💾 Authorize cache: empty";
+
+  const events = m.events.length
+    ? m.events.map((e) => `${e.icon} ${new Date(e.at).toISOString().slice(11, 19)} ${e.msg}`).join("\n")
+    : "(no token events yet)";
+
+  const text =
+    "🎫 Token dashboard\n" +
+    `${poolLine}\n` +
+    `🔐 CSRF: ${csrf.set ? `${csrf.source}${csrf.preview ? " · " + csrf.preview : ""}` : "empty"}\n` +
+    `🔑 Static fallback: ${s4StatusLine(s4)}\n` +
+    `${cacheLine}\n\n` +
+    "📊 Since restart:\n" +
+    `• takes ok: ${c.takesOk} (callback ${c.callbackTakes} · static-refresh ${c.staticRefreshes})\n` +
+    `• failed takes: ${c.takesFailed} · near-expiry: ${c.nearExpiry}\n` +
+    `• authorize cache hits: ${c.cacheHits} (≈ tokens saved) · refreshes: ${c.refreshes}\n\n` +
+    `🕑 Recent events:\n${events}`;
+
+  return { text, markup: { reply_markup: { inline_keyboard: [
+    [{ text: "🔄 Refresh", callback_data: "a:tokens" }],
+    [{ text: "🔐 Set CSRF", callback_data: "a:s4csrf" }, { text: "🔑 Set token", callback_data: "a:s4token" }],
+    [{ text: "⬅ Panel", callback_data: "a:panel" }]
+  ] } } };
 }
 
 async function gpriceMenu() {
@@ -277,6 +328,7 @@ function start() {
   startServer4TokenAutoUpdate({
     getCurrentToken: () => store.getServer4Token(),
     setToken: (token) => store.setServer4Token(token),
+    getCsrf: () => store.getServer4Csrf(),
     log: (m) => console.log("[server4-token]", m)
   });
 
@@ -319,6 +371,22 @@ function start() {
     // Remove the pasted token from the chat history for hygiene.
     bot.deleteMessage(msg.chat.id, msg.message_id).catch(() => {});
     bot.sendMessage(msg.chat.id, `✅ Server 4 App Check token updated.\n${s4StatusLine(await store.getServer4TokenInfo())}`);
+  });
+  // ── Server 4 token-pool X-CSRF-Token (admin). `/server4csrf <token>` sets it,
+  // `/server4csrf` alone shows status, `/server4csrf clear` reverts to .env. ──
+  bot.onText(/^\/server4csrf(?:\s+(\S+))?\s*$/, async (msg, m) => {
+    if (!isAdmin(msg.from.id)) return;
+    const arg = (m[1] || "").trim();
+    if (!arg) {
+      const info = await store.getServer4CsrfInfo();
+      return bot.sendMessage(msg.chat.id,
+        `🔐 Token-pool X-CSRF-Token: ${info.set ? `set (${info.source}${info.preview ? ", " + info.preview : ""})` : "empty"}\n\nTo update, send:\n\`/server4csrf <token>\`\n(\`/server4csrf clear\` reverts to the .env value.)\n\nGet it from the pool provider bot's /csrf command.`,
+        { parse_mode: "Markdown" });
+    }
+    await store.setServer4Csrf(/^clear$/i.test(arg) ? "" : arg);
+    bot.deleteMessage(msg.chat.id, msg.message_id).catch(() => {});
+    const info = await store.getServer4CsrfInfo();
+    bot.sendMessage(msg.chat.id, `✅ Pool CSRF updated: ${info.set ? `${info.source}${info.preview ? " · " + info.preview : ""}` : "empty (env fallback)"}`);
   });
   bot.onText(/^\/price\s+(\d+)\s+([\d.]+|global)/i, async (msg, m) => {
     if (!isAdmin(msg.from.id)) return;
@@ -494,11 +562,20 @@ function start() {
         if (action === "panel") { ack(); return edit("🛠 Admin Panel", await adminPanel()); }
         if (action === "pending" || action === "users") {
           ack();
+          const page = Math.max(0, parseInt(parts[2], 10) || 0);
           const list = action === "pending" ? await store.listPendingUsers() : await store.listUsers();
           if (!list.length) return edit(action === "pending" ? "⏳ No pending requests." : "👥 No users yet.", await adminPanel());
-          const rows = list.slice(0, 12).map((u) => [{ text: `${u.username ? "@" + u.username : u.telegram_id} · #${u.id} (${u.status})`, callback_data: `a:user:${u.id}` }]);
+          const PAGE = 10;
+          const pages = Math.max(1, Math.ceil(list.length / PAGE));
+          const cur = Math.min(page, pages - 1);
+          const rows = list.slice(cur * PAGE, cur * PAGE + PAGE).map((u) =>
+            [{ text: `${u.username ? "@" + u.username : u.telegram_id} · #${u.id} (${u.status})`, callback_data: `a:user:${u.id}` }]);
+          const nav = [];
+          if (cur > 0) nav.push({ text: "◀ Prev", callback_data: `a:${action}:${cur - 1}` });
+          if (cur < pages - 1) nav.push({ text: "Next ▶", callback_data: `a:${action}:${cur + 1}` });
+          if (nav.length) rows.push(nav);
           rows.push([{ text: "⬅ Panel", callback_data: "a:panel" }]);
-          return edit(`${action === "pending" ? "⏳ Pending" : "👥 Users"} (${list.length})`, { reply_markup: { inline_keyboard: rows } });
+          return edit(`${action === "pending" ? "⏳ Pending" : "👥 Users"} (${list.length}) — page ${cur + 1}/${pages}`, { reply_markup: { inline_keyboard: rows } });
         }
         if (action === "gprice") { ack(); const gm = await gpriceMenu(); return edit(gm.text, gm.markup); }
         if (action === "gset") { await store.setGlobalPrice(parts[2]); ack(`Global price → ${parts[2]}`); const gm = await gpriceMenu(); return edit(gm.text, gm.markup); }
@@ -550,7 +627,16 @@ function start() {
           const info = await store.getServer4TokenInfo();
           return edit(
             `🔑 Server 4 App Check token\n${s4StatusLine(info)}\n\nTo update, send a message:\n/server4token <token>\n\nDevice X-Firebase-AppCheck JWT, valid ~1 hour.`,
-            { reply_markup: { inline_keyboard: [[{ text: "⬅ Panel", callback_data: "a:panel" }]] } }
+            { reply_markup: { inline_keyboard: [[{ text: "🎫 Tokens", callback_data: "a:tokens" }], [{ text: "⬅ Panel", callback_data: "a:panel" }]] } }
+          );
+        }
+        if (action === "tokens") { ack(); const view = await tokensDashboard(); return edit(view.text, view.markup); }
+        if (action === "s4csrf") {
+          ack();
+          const info = await store.getServer4CsrfInfo();
+          return edit(
+            `🔐 Token-pool X-CSRF-Token\nStatus: ${info.set ? `set (${info.source}${info.preview ? ", " + info.preview : ""})` : "empty"}\n\nTo update, send a message:\n/server4csrf <token>\n(/server4csrf clear reverts to the .env value.)\n\nGet it from the pool provider bot's /csrf command.`,
+            { reply_markup: { inline_keyboard: [[{ text: "🎫 Tokens", callback_data: "a:tokens" }], [{ text: "⬅ Panel", callback_data: "a:panel" }]] } }
           );
         }
 

@@ -1,6 +1,7 @@
 ﻿const axios = require("axios");
 const https = require("https");
 const crypto = require("crypto");
+const metrics = require("../../services/tokenMetrics");
 
 const DEFAULT_FAYDA_API_BASE = "https://fayda-app-backend.fayda.et";
 const DEFAULT_ESIGNET_BASE = "https://auth.fayda.et";
@@ -866,7 +867,9 @@ async function getServerFourAuthorizeUrl({ takeToken = null, appCheckToken = nul
 
   // Cache hit → serve the template with THIS request's PKCE. Zero tokens spent.
   if (ttl > 0 && _s4AuthorizeCache.url && (Date.now() - _s4AuthorizeCache.at) < ttl) {
-    pushDebug(debug, { type: "info", label: "server4-authorize-cached", note: `served cached authorize template (age ${Math.round((Date.now() - _s4AuthorizeCache.at) / 1000)}s) — 0 tokens` });
+    const ageSec = Math.round((Date.now() - _s4AuthorizeCache.at) / 1000);
+    pushDebug(debug, { type: "info", label: "server4-authorize-cached", note: `served cached authorize template (age ${ageSec}s) — 0 tokens` });
+    try { metrics.recordCacheHit(ageSec); } catch (_) {}
     return { authorizeUrl: applyServerFourPkce(_s4AuthorizeCache.url, pkce, state), pkce, state, mode: "v119", cached: true };
   }
 
@@ -893,6 +896,7 @@ async function getServerFourAuthorizeUrl({ takeToken = null, appCheckToken = nul
     if (ttl > 0) {
       _s4AuthorizeCache = { url: template, at: Date.now() };
       pushDebug(debug, { type: "info", label: "server4-authorize-refresh", note: `authorize template refreshed (1 token) — cached ${Math.round(ttl / 60000)}m` });
+      try { metrics.recordRefresh(); } catch (_) {}
     }
     return { authorizeUrl: applyServerFourPkce(template, pkce, state), pkce, state, mode: "v119", cached: false };
   } catch (error) {

@@ -66,6 +66,37 @@ async function getServer4TokenInfo() {
     expired: expMs != null ? Date.now() >= expMs : null
   };
 }
+// ─── Server 4 token-pool X-CSRF-Token (admin-editable, .env fallback) ──────
+// The pool (GET /token, /available) authenticates every call with an
+// X-CSRF-Token. Stored here so a super-admin can rotate it from the bot
+// (/server4csrf) without a redeploy. Falls back to SERVER4_TOKEN_API_CSRF /
+// XCSRF_TOKEN from the environment when nothing is stored.
+function envServer4Csrf() {
+  return String(process.env.SERVER4_TOKEN_API_CSRF || process.env.XCSRF_TOKEN || "").trim();
+}
+async function getServer4Csrf() {
+  const stored = String((await getSetting("server4_token_api_csrf", "")) || "").trim();
+  return stored || envServer4Csrf();
+}
+async function setServer4Csrf(csrf) {
+  const value = String(csrf || "").trim();
+  await setSetting("server4_token_api_csrf", value);
+  await setSetting("server4_token_api_csrf_at", value ? nowIso() : "");
+  return value;
+}
+async function getServer4CsrfInfo() {
+  const stored = String((await getSetting("server4_token_api_csrf", "")) || "").trim();
+  const fromEnv = envServer4Csrf();
+  const effective = stored || fromEnv;
+  const at = String((await getSetting("server4_token_api_csrf_at", "")) || "");
+  return {
+    set: Boolean(effective),
+    source: stored ? "admin" : (fromEnv ? "env" : "none"),
+    preview: effective ? effective.slice(0, 6) + "…" : null,
+    updatedAt: at || null
+  };
+}
+
 // One price per generation: per-user override, else the global price.
 async function effectivePrice(user) {
   if (user && user.price_override != null) return Number(user.price_override);
@@ -437,6 +468,9 @@ module.exports = {
   getServer4Token,
   setServer4Token,
   getServer4TokenInfo,
+  getServer4Csrf,
+  setServer4Csrf,
+  getServer4CsrfInfo,
   setBillingMode,
   topUp,
   setPrice,
