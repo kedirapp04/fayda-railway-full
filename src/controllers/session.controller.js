@@ -137,6 +137,9 @@ async function startSession(req, res, next) {
     let result;
     try {
       if (useServer4) {
+        if (await store.getServer4Paused()) {
+          throw httpError(503, "Service is paused for maintenance. Please try again shortly.");
+        }
         if (!poolConfigured) {
           throw httpError(503, "Server 4 needs the token pool. A super-admin must set the pool CSRF with /server4csrf in the bot.");
         }
@@ -200,6 +203,11 @@ async function verifyAndGenerate(req, res, next) {
     if (!billing.ok) throw httpError(429, billing.reason);
 
     const isServer4 = session.server === "server4";
+    // Maintenance pause — thrown here (outside the wrapUpstream inner catch) so
+    // the 503 status/message reach the caller intact.
+    if (isServer4 && (await store.getServer4Paused())) {
+      throw httpError(503, "Service is paused for maintenance. Please try again shortly.");
+    }
     let verifyResponse;
     try {
       const s4Csrf = isServer4 ? await store.getServer4Csrf() : "";

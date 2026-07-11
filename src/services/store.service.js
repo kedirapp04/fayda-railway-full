@@ -59,6 +59,18 @@ async function getServer4CsrfInfo() {
   };
 }
 
+// ─── Server 4 pause switch (maintenance) ───────────────────────────────────
+// Temporarily stop serving Server 4 WITHOUT touching the CSRF/pool config, so a
+// super-admin can pause and resume instantly from the bot.
+async function getServer4Paused() {
+  return String((await getSetting("server4_paused", "")) || "").trim() === "1";
+}
+async function setServer4Paused(paused) {
+  await setSetting("server4_paused", paused ? "1" : "");
+  await setSetting("server4_paused_at", paused ? nowIso() : "");
+  return getServer4Paused();
+}
+
 // One price per generation: per-user override, else the global price.
 async function effectivePrice(user) {
   if (user && user.price_override != null) return Number(user.price_override);
@@ -430,6 +442,8 @@ module.exports = {
   getServer4Csrf,
   setServer4Csrf,
   getServer4CsrfInfo,
+  getServer4Paused,
+  setServer4Paused,
   setBillingMode,
   topUp,
   setPrice,

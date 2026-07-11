@@ -121,11 +121,13 @@ async function userMenu(u, viewerIsAdmin) {
 
 async function adminPanel() {
   const csrf = await store.getServer4CsrfInfo();
+  const paused = await store.getServer4Paused();
   return { reply_markup: { inline_keyboard: [
     [{ text: "⏳ Pending", callback_data: "a:pending" }, { text: "👥 Users", callback_data: "a:users" }],
     [{ text: `🌐 Global price: ${await store.globalPrice()}`, callback_data: "a:gprice" }],
     [{ text: "🎫 Tokens", callback_data: "a:tokens" },
      { text: `🔐 CSRF: ${csrf.set ? csrf.source : "empty"}`, callback_data: "a:s4csrf" }],
+    [{ text: paused ? "▶️ Resume Server 4" : "⏸ Pause Server 4", callback_data: "a:s4toggle" }],
     [{ text: "🔄 Refresh", callback_data: "a:panel" }]
   ] } };
 }
@@ -135,6 +137,7 @@ async function adminPanel() {
 // token, so every Server-4 request draws its own fresh single-use token.
 async function tokensDashboard() {
   const csrf = await store.getServer4CsrfInfo();
+  const paused = await store.getServer4Paused();
   const cache = getServer4AuthorizeCacheInfo();
   const m = tokenMetrics.snapshot(12);
   const c = m.counters;
@@ -159,6 +162,7 @@ async function tokensDashboard() {
 
   const text =
     "🎫 Token dashboard (pool-only)\n" +
+    (paused ? "⏸ SERVICE PAUSED — Server 4 not serving (CSRF/pool kept)\n" : "") +
     `${poolLine}\n` +
     `🔐 CSRF: ${csrf.set ? `${csrf.source}${csrf.preview ? " · " + csrf.preview : ""}` : "empty"}\n` +
     `${cacheLine}\n\n` +
@@ -170,6 +174,7 @@ async function tokensDashboard() {
 
   return { text, markup: { reply_markup: { inline_keyboard: [
     [{ text: "🔄 Refresh", callback_data: "a:tokens" }],
+    [{ text: paused ? "▶️ Resume service" : "⏸ Pause service", callback_data: "a:s4toggle" }],
     [{ text: "🔐 Set CSRF", callback_data: "a:s4csrf" }],
     [{ text: "⬅ Panel", callback_data: "a:panel" }]
   ] } } };
@@ -589,6 +594,11 @@ function start() {
           return edit("🛠 Admin Panel", await adminPanel());
         }
         if (action === "tokens") { ack(); const view = await tokensDashboard(); return edit(view.text, view.markup); }
+        if (action === "s4toggle") {
+          const now = await store.setServer4Paused(!(await store.getServer4Paused()));
+          ack(now ? "⏸ Server 4 paused" : "▶️ Server 4 resumed");
+          const view = await tokensDashboard(); return edit(view.text, view.markup);
+        }
         if (action === "s4csrf") {
           ack();
           const info = await store.getServer4CsrfInfo();
