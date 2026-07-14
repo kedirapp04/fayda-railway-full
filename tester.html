@@ -91,9 +91,11 @@
   <!-- Forgot FAN / FIN -->
   <div class="card">
     <h2>🔑 Forgot FAN / FIN <span class="badge">SMS · no OTP</span></h2>
-    <label>Registered phone number</label>
-    <input id="ffPhone" type="text" placeholder="0911223344" />
-    <div class="hint">If a Fayda record is registered to this phone, Fayda SMSes <b>both</b> the FAN (16-digit, = FCN) and the FIN (12-digit) to it. The numbers aren't returned here — only a confirmation.</div>
+    <div class="row">
+      <div><label>Full name</label><input id="ffName" type="text" placeholder="Abebe Kebede Alemu" /></div>
+      <div><label>Registered phone number</label><input id="ffPhone" type="text" placeholder="0911223344" /></div>
+    </div>
+    <div class="hint">If a Fayda record is registered to this phone, Fayda SMSes <b>both</b> the FAN (16-digit, = FCN) and the FIN (12-digit) to it. The numbers aren't returned here — only a confirmation. (id.et keys the SMS to the phone; the name is required, like its form.)</div>
     <button onclick="forgotFan()">Send by SMS</button>
     <div id="ffStatus" class="status"></div>
     <pre id="ffOut" hidden></pre>

@@ -137,22 +137,27 @@ OTP is single-use. On a wrong OTP the session is dropped — restart at step 1.
 > **both**. Either works as the `individualId` in `/api/session` (it accepts
 > 12–16 digits).
 
-`POST {BASE}/api/forgot-fan` — for users who forgot their FAN/FIN. It asks Fayda
-to **SMS both numbers — the FAN (16-digit, = FCN) and the FIN (12-digit) — to the
-phone registered** against that Fayda record. The numbers are delivered by SMS and
-are **never returned** in the response. No OTP, no quota charge.
+`POST {BASE}/api/forgot-fan` — for users who forgot their FAN/FIN. Input is the
+**full name + phone** (same as the id.et form). It asks Fayda to **SMS both
+numbers — the FAN (16-digit, = FCN) and the FIN (12-digit) — to the phone
+registered** against that Fayda record. The numbers are delivered by SMS and are
+**never returned** in the response. No OTP, no quota charge.
 
 ```bash
 curl -X POST "$BASE/api/forgot-fan" \
   -H "x-api-key: $KEY" -H "Content-Type: application/json" \
-  -d '{ "phone": "0911223344" }'
+  -d '{ "name": "Abebe Kebede Alemu", "phone": "0911223344" }'
 ```
 
-`phone` accepts `0911223344`, `+251911223344`, `251911223344`, or `911223344`.
+- `name` — the person's full name (required).
+- `phone` — accepts `0911223344`, `+251911223344`, `251911223344`, or `911223344`.
+- **Note:** id.et's recovery is keyed to the **phone** only; the name is required
+  and echoed back for your records (same as the id.et website form).
 
-- **Success** → `{ "ok": true, "phone": "0911****44", "message": "…" }` (phone masked).
-- `400` invalid phone · `404` no Fayda record for that number · `429` too many
-  attempts for that number (limit **3 / 10 min per phone**) · `502` upstream error.
+- **Success** → `{ "ok": true, "name": "Abebe Kebede Alemu", "phone": "0911****44", "message": "…" }` (phone masked).
+- `400` missing name / invalid phone · `404` no Fayda record for that number ·
+  `429` too many attempts for that number (limit **3 / 10 min per phone**) ·
+  `502` upstream error.
 
 ---
 
@@ -191,10 +196,11 @@ async function fetchJson(sessionId, otp) {
 }
 
 // Forgot FAN/FIN — SMS both numbers (FAN 16-digit = FCN, and FIN 12-digit) to
-// the registered phone. They arrive by SMS; the response only confirms it sent.
-async function forgotFan(phone) {
+// the registered phone. Input is full name + phone; the SMS is keyed to the
+// phone. The numbers arrive by SMS; the response only confirms it sent.
+async function forgotFan(name, phone) {
   try {
-    const res = await axios.post(`${BASE}/api/forgot-fan`, { phone }, { headers: H });
+    const res = await axios.post(`${BASE}/api/forgot-fan`, { name, phone }, { headers: H });
     console.log("Sent:", res.data.message, "→", res.data.phone);   // e.g. "0911****44"
   } catch (e) {
     const s = e.response?.status;
@@ -203,7 +209,7 @@ async function forgotFan(phone) {
     else console.log("Error:", e.response?.data?.error || e.message);
   }
 }
-// forgotFan("0911223344");
+// forgotFan("Abebe Kebede Alemu", "0911223344");
 ```
 
 ## Full example — Python
@@ -228,9 +234,9 @@ def download_pdf(fan, otp_input):
     print(f"Saved {name}.pdf · total used:", r.headers.get("X-Usage-Total"))
 
 # Forgot FAN/FIN — SMS both numbers (FAN 16-digit = FCN, and FIN 12-digit) to
-# the registered phone.
-def forgot_fan(phone):
-    r = requests.post(f"{BASE}/api/forgot-fan", json={"phone": phone}, headers=H)
+# the registered phone. Input is full name + phone; SMS is keyed to the phone.
+def forgot_fan(name, phone):
+    r = requests.post(f"{BASE}/api/forgot-fan", json={"name": name, "phone": phone}, headers=H)
     if r.status_code == 200:
         print("Sent:", r.json()["message"], "→", r.json()["phone"])   # "0911****44"
     elif r.status_code == 404:
@@ -240,7 +246,7 @@ def forgot_fan(phone):
     else:
         print("Error:", r.json().get("error"))
 
-# forgot_fan("0911223344")
+# forgot_fan("Abebe Kebede Alemu", "0911223344")
 ```
 
 ---

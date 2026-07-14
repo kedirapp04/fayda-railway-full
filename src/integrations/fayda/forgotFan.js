@@ -23,7 +23,20 @@ function redactPhone(phone) {
   return s.slice(0, 4) + "****" + s.slice(-2);
 }
 
-// Ask id.et to SMS the FCN to `phone`.
+// Clean a full name for confirmation/audit (strip control + Telegram-bad chars).
+function sanitizeName(raw) {
+  return String(raw || "")
+    .replace(/[\x00-\x1F\x7F]/g, "")
+    .replace(/[<>]/g, "")
+    .trim()
+    .slice(0, 100);
+}
+
+// Ask id.et to SMS the FCN/FAN+FIN to `phone`. NOTE: id.et's resend-sms body is
+// PHONE-ONLY — verified across 6 HAR captures, the full name the form collects is
+// NOT sent upstream (it's ignored). We accept the name at the API for
+// confirmation/audit but deliberately keep the upstream body phone-only so the
+// proven call isn't changed.
 // Returns { ok:true, phone, message } or { ok:false, reason, ... }.
 async function requestFcnBySms(phone) {
   const normalized = normalizePhone(phone);
@@ -65,4 +78,4 @@ async function requestFcnBySms(phone) {
   }
 }
 
-module.exports = { normalizePhone, redactPhone, requestFcnBySms };
+module.exports = { normalizePhone, redactPhone, sanitizeName, requestFcnBySms };
