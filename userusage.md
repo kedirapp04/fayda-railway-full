@@ -2,11 +2,13 @@
 
 Integrate the Fayda API: go from a 12–16 digit FAN/FIN to a finished **PDF**,
 **screenshot**, raw **JSON** user data, or **PDF + JSON together** in **two
-calls** against **one service** with **one key**.
+calls** against **one service** with **one key**. Users who forgot their FAN can
+recover it by SMS with one extra call.
 
 ```
  1. POST  {BASE}/api/session            → sessionId                          (your key)
  2. POST  {BASE}/api/session/:id/verify → PDF / screenshot / json / pdf_json (your key)
+ ·  POST  {BASE}/api/forgot-fan         → SMS the FCN to a registered phone   (your key)
 ```
 
 The OTP is verified and the document is rendered **in the same request** — there
@@ -213,13 +215,14 @@ def download_pdf(fan, otp_input):
 | Code | Meaning |
 |---|---|
 | 200 | success |
-| 400 | bad `individualId` / `otp` |
+| 400 | bad `individualId` / `otp` / `phone` |
 | 401 | missing `x-api-key` |
 | 403 | your key or account is **paused / revoked / not approved** |
+| 404 | `/forgot-fan`: no Fayda record registered to that phone |
 | 410 | session expired / unknown — restart at step 1 |
 | 422 | nothing renderable in the verified payload |
-| 429 | **quota/credit exhausted** — counter: daily/total limit; prepaid: balance too low; postpaid: credit limit reached |
-| 502 | Server-3 upstream (Fayda) error |
+| 429 | **quota/credit exhausted** (session/verify), or **too many attempts for a phone** (`/forgot-fan`, 3 / 10 min) |
+| 502 | upstream (Fayda / id.et) error |
 
 Error body is always `{ "ok": false, "error": "…" }`.
 
