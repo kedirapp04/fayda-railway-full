@@ -50,7 +50,7 @@
   <div class="card">
     <h2>⚙️ Config <span class="badge">saved in this browser</span></h2>
     <div class="row">
-      <div><label>Base URL</label><input id="baseUrl" type="text" placeholder="https://your-app.up.railway.app" /></div>
+      <div><label>Base URL</label><input id="baseUrl" type="text" placeholder="https://fayda-railway-full-production.up.railway.app" /></div>
       <div><label>Your API key (x-api-key)</label>
         <div class="keyrow"><input id="apiKey" type="password" placeholder="rk_…" /><button type="button" class="eye" onclick="toggleKey('apiKey', this)">show</button></div>
       </div>
@@ -121,7 +121,7 @@ function saveCfg() {
   localStorage.setItem("faydaTester", JSON.stringify(cfg()));
   setStatus("cfgStatus", "Saved.", "ok");
 }
-const DEFAULTS = { baseUrl: "", apiKey: "" };
+const DEFAULTS = { baseUrl: "https://fayda-railway-full-production.up.railway.app", apiKey: "" };
 function loadCfg() {
   let c = {};
   try { c = JSON.parse(localStorage.getItem("faydaTester") || "{}"); } catch {}

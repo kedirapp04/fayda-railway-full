@@ -33,7 +33,7 @@ pause/revoke. A Telegram username is required.
 
 Base URL (your Railway deployment):
 ```
-BASE = https://<your-app>.up.railway.app
+BASE = https://fayda-railway-full-production.up.railway.app
 ```
 
 > **Counting:** each *successful* verify counts once. One OTP verification → one
@@ -166,7 +166,7 @@ curl -X POST "$BASE/api/forgot-fan" \
 ```js
 const axios = require("axios");
 
-const BASE = "https://your-app.up.railway.app";
+const BASE = "https://fayda-railway-full-production.up.railway.app";
 const KEY = process.env.FAYDA_KEY;
 const H = { "x-api-key": KEY };
 
@@ -218,7 +218,7 @@ async function forgotFan(name, phone) {
 import requests, os
 from urllib.parse import unquote
 
-BASE = "https://your-app.up.railway.app"
+BASE = "https://fayda-railway-full-production.up.railway.app"
 H    = {"x-api-key": os.environ["FAYDA_KEY"]}
 
 def download_pdf(fan, otp_input):

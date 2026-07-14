@@ -141,6 +141,7 @@ async function userMenu(u, viewerIsAdmin) {
     if (s.key && s.key.status === "active") rows.push([{ text: "⏸ Pause Key", callback_data: "u:pausekey" }, { text: "🗑 Revoke & Replace", callback_data: "u:revokekey" }]);
     else if (s.key && s.key.status === "paused") rows.push([{ text: "▶️ Resume Key", callback_data: "u:resumekey" }, { text: "🗑 Revoke & Replace", callback_data: "u:revokekey" }]);
     else rows.push([{ text: "🗑 Revoke & Replace", callback_data: "u:revokekey" }]);
+    rows.push([{ text: "🔗 API Base URL", callback_data: "u:baseurl" }]);
     if (u.status === "trial") rows.push([{ text: "📨 Request Full Access + Docs", callback_data: "u:request" }]);
   } else {
     if (!u.trial_claimed) rows.push([{ text: `🎁 Free Tester Key (${env.TRIAL_REWARD_COUNT})`, callback_data: "u:tester" }]);
@@ -330,8 +331,19 @@ async function sendDocs(chatId) {
 }
 function sendKey(chatId, rawKey, prefix) {
   return bot.sendMessage(chatId,
-    `${prefix}\n\n<code>${rawKey}</code>\n\nSend it as the <b>x-api-key</b> header to POST /api/session and /api/session/:id/verify.`,
+    `${prefix}\n\n🔗 <b>Base URL</b>\n<code>${env.PUBLIC_BASE_URL}</code>\n\n🔑 <b>API key</b> (x-api-key)\n<code>${rawKey}</code>\n\n` +
+    `Call it as:\n<code>POST ${env.PUBLIC_BASE_URL}/api/session</code>\n<code>POST ${env.PUBLIC_BASE_URL}/api/session/:id/verify</code>\n` +
+    `Send the key in the <b>x-api-key</b> header.`,
     { parse_mode: "HTML" });
+}
+
+// The public API base URL block — sent on approval and via the menu button.
+function baseUrlText() {
+  return `🔗 <b>API Base URL</b>\n<code>${env.PUBLIC_BASE_URL}</code>\n\n` +
+    `Endpoints:\n• <code>POST ${env.PUBLIC_BASE_URL}/api/session</code>\n` +
+    `• <code>POST ${env.PUBLIC_BASE_URL}/api/session/:id/verify</code>\n` +
+    `• <code>POST ${env.PUBLIC_BASE_URL}/api/forgot-fan</code>\n\n` +
+    `Send your key in the <b>x-api-key</b> header.`;
 }
 
 function start() {
@@ -535,6 +547,7 @@ function start() {
           if (u.status === "approved") ack("Already approved");
           else { await store.setUserStatus(u.id, "pending"); ack("Request sent — admin will review"); notifyAdmins(`🆕 Access+docs request from @${u.username || "?"} (id #${u.id})`); }
         } else if (action === "usage" || action === "saves") { ack(); await bot.sendMessage(chatId, await userSavesText(u)); }
+        else if (action === "baseurl") { ack(); await bot.sendMessage(chatId, baseUrlText(), { parse_mode: "HTML" }); }
         else if (action === "tester") { ack("Issuing tester key…"); await claimTesterFlow(chatId, u); }
         else if (action === "addbalance") {
           // Pre-CBE: notify admins to top up manually. (CBE self-service drops in here.)

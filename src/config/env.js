@@ -33,6 +33,10 @@ const env = {
   FAYDA_API_KEY: process.env.FAYDA_API_KEY || "",
   SERVER_THREE_OTP_CHANNELS: process.env.SERVER_THREE_OTP_CHANNELS || "email,phone",
 
+  // Public base URL of THIS API (what clients call). Sent to users with their
+  // key on approval, and shown by the "🔗 API Base URL" menu button.
+  PUBLIC_BASE_URL: (process.env.PUBLIC_BASE_URL || "https://fayda-railway-full-production.up.railway.app").replace(/\/+$/, ""),
+
   // ── Telegram management bot (admin: approve users, keys, limits, billing) ─
   TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN || "",
   ADMIN_TELEGRAM_IDS: String(process.env.ADMIN_TELEGRAM_IDS || "")
