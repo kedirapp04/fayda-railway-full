@@ -34,6 +34,37 @@ const pendingInput = new Map();
 // when a user taps Pay All / Pay #id; consumed by the message handler when they
 // send the receipt (text, photo, or PDF).
 const pendingReceipt = new Map();
+
+// Admin broadcast: chatIds awaiting the announcement text, then the drafted text
+// awaiting an audience pick.
+const bcAwaiting = new Set();
+const bcDraft = new Map();
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Send `text` to every target, throttled under Telegram's ~30 msg/s cap. A send
+// fails when the user never /started the bot or blocked it — counted, not fatal.
+async function runBroadcast(text, scope) {
+  const ids = await store.broadcastTargets(scope);
+  let sent = 0;
+  let failed = 0;
+  for (const id of ids) {
+    try {
+      await bot.sendMessage(id, text, { disable_web_page_preview: false });
+      sent++;
+    } catch (e) {
+      const retryAfter = e?.response?.body?.parameters?.retry_after;
+      if (retryAfter) {
+        await sleep((retryAfter + 1) * 1000);
+        try { await bot.sendMessage(id, text); sent++; } catch (_) { failed++; }
+      } else {
+        failed++;
+      }
+    }
+    await sleep(45); // ~22/s
+  }
+  return { sent, failed, total: ids.length };
+}
 const TESTER_PATH = path.join(__dirname, "..", "..", "tester.html");
 const DOCS_PATH = path.join(__dirname, "..", "..", "userusage.md");
 
@@ -127,6 +158,7 @@ async function adminPanel() {
     [{ text: `🌐 Global price: ${await store.globalPrice()}`, callback_data: "a:gprice" }],
     [{ text: "🎫 Tokens", callback_data: "a:tokens" },
      { text: `🔐 CSRF: ${csrf.set ? csrf.source : "empty"}`, callback_data: "a:s4csrf" }],
+    [{ text: "📢 Broadcast", callback_data: "a:broadcast" }],
     [{ text: paused ? "▶️ Resume Server 4" : "⏸ Pause Server 4", callback_data: "a:s4toggle" }],
     [{ text: "🔄 Refresh", callback_data: "a:panel" }]
   ] } };
@@ -432,6 +464,24 @@ function start() {
         return;
       }
 
+      // (a2) Admin broadcast announcement text.
+      if (bcAwaiting.has(key) && isAdmin(msg.from.id)) {
+        bcAwaiting.delete(key);
+        const body = String(msg.text || "").trim();
+        if (!body || /^\/cancel\b/i.test(body)) { bot.sendMessage(msg.chat.id, body ? "✖️ Cancelled." : "Empty — tap 📢 Broadcast again."); return; }
+        bcDraft.set(key, body);
+        const all = (await store.broadcastTargets("all")).length;
+        const active = (await store.broadcastTargets("active")).length;
+        bot.sendMessage(msg.chat.id, `📢 Preview:\n\n${body}\n\n— Send to whom?`, {
+          reply_markup: { inline_keyboard: [
+            [{ text: `👥 All users (${all})`, callback_data: "a:bcsend:all" }],
+            [{ text: `✅ Active only (${active})`, callback_data: "a:bcsend:active" }],
+            [{ text: "✖️ Cancel", callback_data: "a:panel" }]
+          ] }
+        });
+        return;
+      }
+
       // (b) Admin manual numeric input.
       const pend = pendingInput.get(key);
       if (!pend) return;
@@ -469,10 +519,11 @@ function start() {
     const edit = (text, markup) => bot.editMessageText(text, { chat_id: chatId, message_id: msgId, ...(markup || {}) }).catch(() => {});
     const reRenderMenu = async (u) => { const m = await userMenu(u, isAdmin(fromId)); return edit(m.text, m.markup); };
 
-    // Any button press abandons a half-finished manual-input / receipt prompt for
-    // this chat. (The ask*/pay* handlers below re-set it immediately after.)
+    // Any button press abandons a half-finished manual-input / receipt / broadcast
+    // prompt for this chat. (The ask*/pay*/broadcast handlers below re-set it.)
     pendingInput.delete(String(chatId));
     pendingReceipt.delete(String(chatId));
+    bcAwaiting.delete(String(chatId));
 
     try {
       if (data.startsWith("u:")) {
@@ -531,6 +582,22 @@ function start() {
         const action = parts[1];
 
         if (action === "panel") { ack(); return edit("🛠 Admin Panel", await adminPanel()); }
+        if (action === "broadcast") {
+          bcAwaiting.add(String(chatId));
+          bcDraft.delete(String(chatId));
+          ack();
+          return edit("📢 Send me the announcement text to broadcast to your API users.\n(Plain text + emoji. Send /cancel to abort.)",
+            { reply_markup: { inline_keyboard: [[{ text: "⬅ Panel", callback_data: "a:panel" }]] } });
+        }
+        if (action === "bcsend") {
+          const text = bcDraft.get(String(chatId));
+          bcDraft.delete(String(chatId));
+          if (!text) { ack("Draft expired — start again"); return edit("🛠 Admin Panel", await adminPanel()); }
+          ack("Broadcasting…");
+          await edit(`📢 Broadcasting to ${parts[2] === "active" ? "active users" : "all users"}… I'll report when done.`);
+          const r = await runBroadcast(text, parts[2]);
+          return bot.sendMessage(chatId, `📢 Broadcast done.\n✅ Sent: ${r.sent}\n⚠️ Failed: ${r.failed} (blocked / never started the bot)\n👥 Total: ${r.total}`);
+        }
         if (action === "pending" || action === "users") {
           ack();
           const page = Math.max(0, parseInt(parts[2], 10) || 0);

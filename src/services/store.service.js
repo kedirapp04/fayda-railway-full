@@ -91,6 +91,17 @@ async function listPendingUsers() {
   return query(`SELECT * FROM users WHERE status = 'pending' ORDER BY id DESC`);
 }
 
+// Telegram ids to broadcast to. scope "active" = approved/trial users only;
+// anything else = everyone except revoked. Null telegram_ids are dropped.
+async function broadcastTargets(scope) {
+  const sql =
+    scope === "active"
+      ? `SELECT telegram_id FROM users WHERE status IN ('approved','trial') AND telegram_id IS NOT NULL`
+      : `SELECT telegram_id FROM users WHERE status <> 'revoked' AND telegram_id IS NOT NULL`;
+  const rows = await query(sql);
+  return rows.map((r) => r.telegram_id).filter(Boolean);
+}
+
 async function getOrCreateUser(telegramId, username) {
   const tg = String(telegramId);
   const existing = await getUserByTelegramId(tg);
@@ -411,6 +422,7 @@ module.exports = {
   getUserByTelegramId,
   listUsers,
   listPendingUsers,
+  broadcastTargets,
   setUserStatus,
   setLimits,
   claimTrial,
