@@ -128,6 +128,27 @@ OTP is single-use. On a wrong OTP the session is dropped — restart at step 1.
 
 ---
 
+## Forgot FAN — recover your number by SMS
+
+`POST {BASE}/api/forgot-fan` — for users who forgot their FAN/FCN. It asks Fayda
+to **SMS the FCN to the phone number registered** against that Fayda record. The
+number is delivered by SMS and is **never returned** in the response. No OTP, no
+quota charge.
+
+```bash
+curl -X POST "$BASE/api/forgot-fan" \
+  -H "x-api-key: $KEY" -H "Content-Type: application/json" \
+  -d '{ "phone": "0911223344" }'
+```
+
+`phone` accepts `0911223344`, `+251911223344`, `251911223344`, or `911223344`.
+
+- **Success** → `{ "ok": true, "phone": "0911****44", "message": "…" }` (phone masked).
+- `400` invalid phone · `404` no Fayda record for that number · `429` too many
+  attempts for that number (limit **3 / 10 min per phone**) · `502` upstream error.
+
+---
+
 ## Full example — Node.js
 
 ```js
