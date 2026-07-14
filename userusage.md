@@ -8,7 +8,7 @@ recover it by SMS with one extra call.
 ```
  1. POST  {BASE}/api/session            → sessionId                          (your key)
  2. POST  {BASE}/api/session/:id/verify → PDF / screenshot / json / pdf_json (your key)
- ·  POST  {BASE}/api/forgot-fan         → SMS the FCN/FAN/FIN to a reg. phone  (your key)
+ ·  POST  {BASE}/api/forgot-fan         → SMS the FAN + FIN to a registered phone (your key)
 ```
 
 The OTP is verified and the document is rendered **in the same request** — there
@@ -132,14 +132,15 @@ OTP is single-use. On a wrong OTP the session is dropped — restart at step 1.
 
 ## Forgot FAN — recover your number by SMS
 
-> **FCN = FAN = FIN.** They're all names for the same Fayda number — the FCN
-> (Fayda Card Number) is what you enter as the `individualId`/FAN/FIN elsewhere
-> in this API. This endpoint recovers that number.
+> **FAN vs FIN.** Your **FAN** (= **FCN**, the Fayda Card Number) is **16 digits**;
+> your **FIN** is a **different, 12-digit** number. This endpoint texts the user
+> **both**. Either works as the `individualId` in `/api/session` (it accepts
+> 12–16 digits).
 
-`POST {BASE}/api/forgot-fan` — for users who forgot their FAN/FCN/FIN. It asks
-Fayda to **SMS the number (FCN/FAN/FIN) to the phone registered** against that
-Fayda record. The number is delivered by SMS and is **never returned** in the
-response. No OTP, no quota charge.
+`POST {BASE}/api/forgot-fan` — for users who forgot their FAN/FIN. It asks Fayda
+to **SMS both numbers — the FAN (16-digit, = FCN) and the FIN (12-digit) — to the
+phone registered** against that Fayda record. The numbers are delivered by SMS and
+are **never returned** in the response. No OTP, no quota charge.
 
 ```bash
 curl -X POST "$BASE/api/forgot-fan" \
@@ -189,8 +190,8 @@ async function fetchJson(sessionId, otp) {
   // res.data.photo / .qr / .front / .back are base64 (or null)
 }
 
-// Forgot FAN/FCN/FIN — SMS the number to the phone registered on the record.
-// The number is delivered by SMS; the response only confirms it was sent.
+// Forgot FAN/FIN — SMS both numbers (FAN 16-digit = FCN, and FIN 12-digit) to
+// the registered phone. They arrive by SMS; the response only confirms it sent.
 async function forgotFan(phone) {
   try {
     const res = await axios.post(`${BASE}/api/forgot-fan`, { phone }, { headers: H });
@@ -226,7 +227,8 @@ def download_pdf(fan, otp_input):
     open(f"{name}.pdf", "wb").write(r.content)
     print(f"Saved {name}.pdf · total used:", r.headers.get("X-Usage-Total"))
 
-# Forgot FAN/FCN/FIN — SMS the number to the phone registered on the record.
+# Forgot FAN/FIN — SMS both numbers (FAN 16-digit = FCN, and FIN 12-digit) to
+# the registered phone.
 def forgot_fan(phone):
     r = requests.post(f"{BASE}/api/forgot-fan", json={"phone": phone}, headers=H)
     if r.status_code == 200:

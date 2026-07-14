@@ -87,6 +87,17 @@
     <div id="imgs" class="imgs"></div>
     <iframe id="pdfFrame" hidden></iframe>
   </div>
+
+  <!-- Forgot FAN / FIN -->
+  <div class="card">
+    <h2>🔑 Forgot FAN / FIN <span class="badge">SMS · no OTP</span></h2>
+    <label>Registered phone number</label>
+    <input id="ffPhone" type="text" placeholder="0911223344" />
+    <div class="hint">If a Fayda record is registered to this phone, Fayda SMSes <b>both</b> the FAN (16-digit, = FCN) and the FIN (12-digit) to it. The numbers aren't returned here — only a confirmation.</div>
+    <button onclick="forgotFan()">Send by SMS</button>
+    <div id="ffStatus" class="status"></div>
+    <pre id="ffOut" hidden></pre>
+  </div>
 </div>
 
 <script>
@@ -233,6 +244,26 @@ async function verify() {
       setStatus("s2status", j.images.length + " image(s) for " + (j.name || "result") + ".", "ok");
     }
   } catch (e) { setStatus("s2status", "Request failed: " + e.message, "err"); }
+}
+
+// ── Forgot FAN/FIN: SMS both numbers to the registered phone (no OTP) ──
+async function forgotFan() {
+  const c = cfg();
+  if (!c.baseUrl || !c.apiKey) return setStatus("ffStatus", "Set base URL + your API key.", "err");
+  const phone = $("ffPhone").value.trim();
+  if (!phone) return setStatus("ffStatus", "Enter the registered phone number.", "err");
+  setStatus("ffStatus", "Requesting SMS…");
+  try {
+    const r = await fetch(c.baseUrl + "/api/forgot-fan", {
+      method:"POST", headers:{ "x-api-key":c.apiKey, "Content-Type":"application/json" },
+      body: JSON.stringify({ phone })
+    });
+    const j = await r.json(); show("ffOut", j);
+    if (r.ok && j.ok) return setStatus("ffStatus", "✅ Sent to " + (j.phone || "phone") + ". Check the SMS for the FAN + FIN.", "ok");
+    if (r.status === 404) return setStatus("ffStatus", "No Fayda record is registered to that phone.", "err");
+    if (r.status === 429) return setStatus("ffStatus", "Too many attempts for that number — try again later.", "err");
+    setStatus("ffStatus", "Error: " + (j.error || r.status), "err");
+  } catch (e) { setStatus("ffStatus", "Request failed: " + e.message, "err"); }
 }
 </script>
 </body>
