@@ -252,13 +252,15 @@ async function verify() {
 async function forgotFan() {
   const c = cfg();
   if (!c.baseUrl || !c.apiKey) return setStatus("ffStatus", "Set base URL + your API key.", "err");
+  const name = $("ffName").value.trim();
   const phone = $("ffPhone").value.trim();
+  if (!name) return setStatus("ffStatus", "Enter the full name (e.g. Abebe Kebede Alemu).", "err");
   if (!phone) return setStatus("ffStatus", "Enter the registered phone number.", "err");
   setStatus("ffStatus", "Requesting SMS…");
   try {
     const r = await fetch(c.baseUrl + "/api/forgot-fan", {
       method:"POST", headers:{ "x-api-key":c.apiKey, "Content-Type":"application/json" },
-      body: JSON.stringify({ phone })
+      body: JSON.stringify({ name, phone })
     });
     const j = await r.json(); show("ffOut", j);
     if (r.ok && j.ok) return setStatus("ffStatus", "✅ Sent to " + (j.phone || "phone") + ". Check the SMS for the FAN + FIN.", "ok");
