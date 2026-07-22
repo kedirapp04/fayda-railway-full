@@ -133,7 +133,14 @@ class CookieJar {
   }
 }
 
-function buildBackendHeaders(apiKey, minimal = false) {
+// Random public-ish IPv4 to spoof the client IP on Fayda calls (X-Forwarded-For /
+// X-Real-IP), reducing per-IP rate limiting / blocks from the Fayda backend. NOT used
+// for the token pool (that's our own server). Mirrors faydapdf-py server4_provider.
+function randomIp() {
+  const r = (a, b) => a + Math.floor(Math.random() * (b - a + 1));
+  return `${r(20, 219)}.${r(1, 254)}.${r(1, 254)}.${r(1, 254)}`;
+}
+function buildBackendHeaders(apiKey, minimal = false, spoofIp = null) {
   const headers = minimal
     ? { "Content-Type": "application/json" }
     : { accept: "application/json, text/plain, */*", "Content-Type": "application/json" };
@@ -141,18 +148,26 @@ function buildBackendHeaders(apiKey, minimal = false) {
   if (apiKey) {
     headers["x-api-key"] = apiKey;
   }
+  if (spoofIp) {
+    headers["X-Forwarded-For"] = spoofIp;
+    headers["X-Real-IP"] = spoofIp;
+  }
 
   return headers;
 }
-function buildBrowserHeaders(extra = {}) {
+function buildBrowserHeaders(extra = {}, spoofIp = null) {
   const base = process.env.ESIGNET_BASE || process.env.FAYDA_ESIGNET_BASE || DEFAULT_ESIGNET_BASE;
-  return {
+  const headers = {
     accept: "application/json, text/plain, */*",
     origin: base,
     referer: `${base}/login?state=fayda-app`,
     "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
-    ...extra
   };
+  if (spoofIp) {
+    headers["X-Forwarded-For"] = spoofIp;
+    headers["X-Real-IP"] = spoofIp;
+  }
+  return { ...headers, ...extra };
 }
 
 function isDebugRedactionEnabled(debug) {
@@ -436,14 +451,15 @@ function buildEsignetHeaders(session, extra = {}) {
     "oauth-details-hash": session.oauthDetailsHash,
     "oauth-details-key": session.transactionId,
     ...extra
-  });
+  }, session.spoofIp || null);   // same IP for every step of this eSignet session
 }
 
 async function getServerThreeAuthorizeUrl(debug = null) {
   const config = getConfig();
 
-  const headersNoKey = buildBackendHeaders(null, config.minimalBackendHeaders);
-  const headersWithKey = buildBackendHeaders(config.apiKey, config.minimalBackendHeaders);
+  const spoofIp = randomIp();
+  const headersNoKey = buildBackendHeaders(null, config.minimalBackendHeaders, spoofIp);
+  const headersWithKey = buildBackendHeaders(config.apiKey, config.minimalBackendHeaders, spoofIp);
 
   const mode = config.backendUseApiKey;
   const attempts = [];
@@ -502,6 +518,7 @@ async function initializeServerThreeSession(authorizeUrl, debug = null) {
   const config = getConfig();
   const jar = new CookieJar();
   const authUrl = new URL(authorizeUrl);
+  const spoofIp = randomIp();   // one client IP for this whole eSignet session
   const client = axios.create({
     baseURL: config.esignetBase,
     timeout: config.timeoutMs,
@@ -514,13 +531,13 @@ async function initializeServerThreeSession(authorizeUrl, debug = null) {
     url: `${authUrl.pathname}${authUrl.search}`,
     headers: buildBrowserHeaders({
       accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-    })
+    }, spoofIp)
   }, debug, "esignet-authorize-page");
 
   const csrfResponse = await requestWithCookies(client, jar, {
     method: "GET",
     url: "/v1/esignet/csrf/token",
-    headers: buildBrowserHeaders({ "Content-Type": "application/json", referer: authorizeUrl })
+    headers: buildBrowserHeaders({ "Content-Type": "application/json", referer: authorizeUrl }, spoofIp)
   }, debug, "esignet-csrf-token");
 
   const xsrfToken = getXsrfToken(jar, csrfResponse.data);
@@ -542,7 +559,7 @@ async function initializeServerThreeSession(authorizeUrl, debug = null) {
       "Content-Type": "application/json",
       "X-XSRF-TOKEN": xsrfToken,
       referer: authorizeUrl
-    }),
+    }, spoofIp),
     data: oauthDetailsRequest
   }, debug, "esignet-oauth-details");
   throwIfEsignetErrors(oauthResponse.data, "Failed to initialize eSignet OAuth details.");
@@ -558,7 +575,8 @@ async function initializeServerThreeSession(authorizeUrl, debug = null) {
     xsrfToken,
     oauthDetails,
     oauthDetailsHash: hashOauthDetails(oauthDetails),
-    transactionId: oauthDetails.transactionId
+    transactionId: oauthDetails.transactionId,
+    spoofIp   // reused by buildEsignetHeaders for every subsequent OTP/callback step
   };
 }
 
@@ -726,8 +744,9 @@ async function exchangeServerThreeAuthorizationCode(code, debug = null) {
     config.faydaApiBase + "/api/v2/auth/callback?code=" + encodedCode
   ];
 
-  const headersNoKey = buildBackendHeaders(null, config.minimalBackendHeaders);
-  const headersWithKey = buildBackendHeaders(config.apiKey, config.minimalBackendHeaders);
+  const spoofIp = randomIp();
+  const headersNoKey = buildBackendHeaders(null, config.minimalBackendHeaders, spoofIp);
+  const headersWithKey = buildBackendHeaders(config.apiKey, config.minimalBackendHeaders, spoofIp);
 
   const mode = config.backendUseApiKey;
   const headerAttempts = [];
@@ -882,7 +901,8 @@ async function getServerFourAuthorizeUrl({ takeToken = null, appCheckToken = nul
     `&state=${encodeURIComponent(state)}`;
   const headers = buildBackendHeaders(
     config.backendUseApiKey === "never" ? null : config.apiKey,
-    config.minimalBackendHeaders
+    config.minimalBackendHeaders,
+    randomIp()
   );
   if (tok) headers["X-Firebase-AppCheck"] = tok;
 
@@ -922,7 +942,8 @@ async function exchangeServerFourCallback({ code, codeVerifier = null, state = n
   const url = config.faydaApiBase + "/api/v2/auth/callback";
   const headers = buildBackendHeaders(
     config.backendUseApiKey === "never" ? null : config.apiKey,
-    config.minimalBackendHeaders
+    config.minimalBackendHeaders,
+    randomIp()
   );
   const tok = resolveServer4AppCheck(appCheckToken);
   if (tok) headers["X-Firebase-AppCheck"] = tok;
