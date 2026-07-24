@@ -38,9 +38,9 @@ async function forgotFan(req, res, next) {
   try {
     const name = sanitizeName(req.body?.name || req.body?.fullName || req.body?.full_name || "");
     const phone = normalizePhone(req.body?.phone || req.body?.individualId || "");
-    // Require a full name (≥ 2 parts, e.g. "Abebe Kebede Alemu"), not a single word.
-    if (!name || name.split(/\s+/).filter(Boolean).length < 2) {
-      throw httpError(400, "Full name is required (e.g. Abebe Kebede Alemu).");
+    // Require a full name in ENGLISH (≥ 2 Latin-letter words, e.g. "Abebe Kebede Alemu").
+    if (!name || name.split(/\s+/).filter(Boolean).length < 2 || !/^[A-Za-z][A-Za-z '.\-]*$/.test(name)) {
+      throw httpError(400, "Full name is required in English (e.g. Abebe Kebede Alemu).");
     }
     if (!phone) {
       throw httpError(400, "A valid Ethiopian phone number is required (e.g. 09XXXXXXXX).");
