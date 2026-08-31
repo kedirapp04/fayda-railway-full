@@ -71,6 +71,51 @@ async function setServer4Paused(paused) {
   return getServer4Paused();
 }
 
+// ─── Server 5 (resident portal) ────────────────────────────────────────────
+// server5_active: the admin switch that makes Server 5 the DEFAULT engine. When
+// on, ordinary requests (no explicit server chosen) with a 16-digit FAN are served
+// by Server 5; 12-digit FINs and everything else fall back to the old flow. The
+// end user picks nothing — only this admin choice decides.
+async function getServer5Active() {
+  return String((await getSetting("server5_active", "")) || "").trim() === "1";
+}
+async function setServer5Active(on) {
+  await setSetting("server5_active", on ? "1" : "");
+  await setSetting("server5_active_at", on ? nowIso() : "");
+  return getServer5Active();
+}
+
+// resident_basic_auth: the api-resident Basic credential (base64 of
+// "resident:<secret>"). Admin-editable, falls back to RESIDENT_BASIC_AUTH.
+async function getResidentBasicAuth() {
+  const stored = String((await getSetting("resident_basic_auth", "")) || "").trim();
+  return stored || String(process.env.RESIDENT_BASIC_AUTH || "").trim();
+}
+async function setResidentBasicAuth(value) {
+  await setSetting("resident_basic_auth", String(value || "").trim());
+  return getResidentBasicAuth();
+}
+
+// server5_qr_gen: which generated-QR mode the server5 card carries. A generated
+// QR cannot verify; this chooses HOW it fails — data (+sample sig), nosig (empty
+// sig), blank (empty legacy QR), or unscannable (looks real, cannot be scanned).
+const SERVER5_QR_MODES = ["data", "nosig", "blank", "unscannable"];
+function normalizeQrGen(value) {
+  const v = String(value || "").trim().toLowerCase();
+  return SERVER5_QR_MODES.includes(v) ? v : null;
+}
+async function getServer5QrGen() {
+  const stored = normalizeQrGen(await getSetting("server5_qr_gen", ""));
+  return stored || normalizeQrGen(process.env.SERVER5_QR_GEN_DEFAULT) || "data";
+}
+async function setServer5QrGen(value) {
+  const mode = normalizeQrGen(value);
+  if (!mode) throw new Error(`Invalid QR mode. Use one of: ${SERVER5_QR_MODES.join(", ")}`);
+  await setSetting("server5_qr_gen", mode);
+  await setSetting("server5_qr_gen_at", nowIso());
+  return mode;
+}
+
 // One price per generation: per-user override, else the global price.
 async function effectivePrice(user) {
   if (user && user.price_override != null) return Number(user.price_override);
@@ -456,6 +501,13 @@ module.exports = {
   getServer4CsrfInfo,
   getServer4Paused,
   setServer4Paused,
+  getResidentBasicAuth,
+  setResidentBasicAuth,
+  getServer5Active,
+  setServer5Active,
+  getServer5QrGen,
+  setServer5QrGen,
+  SERVER5_QR_MODES,
   setBillingMode,
   topUp,
   setPrice,

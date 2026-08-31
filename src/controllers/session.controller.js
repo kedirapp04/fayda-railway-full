@@ -5,6 +5,10 @@ const {
   sendServerFourOtp,
   authenticateServerFourOtp
 } = require("../integrations/fayda/server3AuthFlow");
+const {
+  sendServerFiveOtp,
+  authenticateServerFiveOtp
+} = require("../integrations/fayda/server5Flow");
 const { takeFreshAppCheckToken } = require("../services/server4TokenUpdater");
 const { createSession, getSession, deleteSession } = require("../services/otpSession.service");
 const { maskFan } = require("../utils/crypto");
@@ -132,11 +136,38 @@ async function startSession(req, res, next) {
     const serverChoice = String(req.body?.server || "").toLowerCase().replace(/[\s._-]/g, "");
     const explicitS3 = ["server3", "3", "esignet", "v117"].includes(serverChoice);
     const explicitS4 = ["server4", "4", "v119", "faydaapp", "appcheck"].includes(serverChoice);
-    const useServer4 = explicitS4 || (!explicitS3 && poolConfigured);
+    const explicitS5 = ["server5", "5", "resident", "residentportal"].includes(serverChoice);
+
+    // The end user never picks a server — only the admin's Server-5 switch decides
+    // whether the DEFAULT (unspecified) flow runs on Server 5 or the old flow.
+    // Server 5 handles 16-digit FANs only, so a 12-digit FIN always uses the old
+    // flow, and Server 5 is chosen by default only when it is actually usable
+    // (basic auth configured). An explicit server: param still overrides (testing).
+    const server5Default = !explicitS3 && !explicitS4 && !explicitS5
+      && /^\d{16}$/.test(individualId)
+      && (await store.getServer5Active())
+      && Boolean(await store.getResidentBasicAuth());
+
+    let selectedServer;
+    if (explicitS5 || server5Default) selectedServer = "server5";
+    else if (explicitS4 || (!explicitS3 && poolConfigured)) selectedServer = "server4";
+    else selectedServer = "server3";
+
+    // Server 5 (resident portal) accepts the 16-digit FAN only.
+    if (selectedServer === "server5" && !/^\d{16}$/.test(individualId)) {
+      throw httpError(400, "Server 5 needs a 16-digit FAN.");
+    }
 
     let result;
+    let authSession;
     try {
-      if (useServer4) {
+      if (selectedServer === "server5") {
+        if (!(await store.getResidentBasicAuth())) {
+          throw httpError(503, "Server 5 is not configured. Set RESIDENT_BASIC_AUTH (or the resident_basic_auth setting).");
+        }
+        result = await sendServerFiveOtp(individualId);
+        authSession = result.serverFiveAuthSession;
+      } else if (selectedServer === "server4") {
         if (await store.getServer4Paused()) {
           throw httpError(503, "Service is paused for maintenance. Please try again shortly.");
         }
@@ -147,28 +178,30 @@ async function startSession(req, res, next) {
         result = await sendServerFourOtp(individualId, {
           takeToken: makeServer4TokenTaker(s4Csrf, "authorize")
         });
+        authSession = result.serverFourAuthSession;
       } else {
         result = await sendServerThreeOtp(individualId);
+        authSession = result.serverThreeAuthSession;
       }
     } catch (error) {
       if (error.statusCode) throw error;
-      throw wrapUpstream(error, `Failed to send OTP on ${useServer4 ? "Server 4" : "Server 3"}.`);
+      throw wrapUpstream(error, `Failed to send OTP on ${selectedServer}.`);
     }
 
-    const sessionId = createSession({
-      individualId,
-      server: useServer4 ? "server4" : "server3",
-      authSession: useServer4 ? result.serverFourAuthSession : result.serverThreeAuthSession
-    });
+    const sessionId = createSession({ individualId, server: selectedServer, authSession });
+
+    const channels = selectedServer === "server5"
+      ? ["phone"]
+      : env.SERVER_THREE_OTP_CHANNELS.split(",").map((c) => c.trim()).filter(Boolean);
 
     res.json({
       ok: true,
       sessionId,
-      server: useServer4 ? "server4" : "server3",
+      server: selectedServer,
       fan: maskFan(individualId),
       maskedMobile: result.maskedMobile || null,
       maskedEmail: result.maskedEmail || null,
-      channels: env.SERVER_THREE_OTP_CHANNELS.split(",").map((c) => c.trim()).filter(Boolean)
+      channels
     });
   } catch (error) {
     next(error);
@@ -210,20 +243,30 @@ async function verifyAndGenerate(req, res, next) {
     }
     let verifyResponse;
     try {
-      const s4Csrf = isServer4 ? await store.getServer4Csrf() : "";
-      verifyResponse = isServer4
-        ? await authenticateServerFourOtp({
-            otp,
-            individualId: session.individualId,
-            authSession: session.authSession,
-            // The callback is where the token is actually spent — take a FRESH one.
-            takeToken: makeServer4TokenTaker(s4Csrf, "callback")
-          })
-        : await authenticateServerThreeOtp({
-            otp,
-            individualId: session.individualId,
-            authSession: session.authSession
-          });
+      if (session.server === "server5") {
+        verifyResponse = await authenticateServerFiveOtp({
+          otp,
+          individualId: session.individualId,
+          authSession: session.authSession,
+          basicAuth: await store.getResidentBasicAuth(),
+          qrGen: await store.getServer5QrGen()
+        });
+      } else if (isServer4) {
+        const s4Csrf = await store.getServer4Csrf();
+        verifyResponse = await authenticateServerFourOtp({
+          otp,
+          individualId: session.individualId,
+          authSession: session.authSession,
+          // The callback is where the token is actually spent — take a FRESH one.
+          takeToken: makeServer4TokenTaker(s4Csrf, "callback")
+        });
+      } else {
+        verifyResponse = await authenticateServerThreeOtp({
+          otp,
+          individualId: session.individualId,
+          authSession: session.authSession
+        });
+      }
     } catch (error) {
       // OTP is single-use on the eSignet flow — drop the session so the caller restarts.
       deleteSession(sessionId);

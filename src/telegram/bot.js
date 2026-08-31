@@ -403,6 +403,65 @@ function start() {
     const info = await store.getServer4CsrfInfo();
     bot.sendMessage(msg.chat.id, `✅ Pool CSRF updated: ${info.set ? `${info.source}${info.preview ? " · " + info.preview : ""}` : "empty (env fallback)"}`);
   });
+  // ── Server 5 (resident portal) QR mode (admin). The generated card QR cannot
+  // verify — this chooses HOW it fails. `/qrmode` alone shows current + choices. ──
+  bot.onText(/^\/qrmode(?:\s+(\S+))?\s*$/, async (msg, m) => {
+    if (!isAdmin(msg.from.id)) return;
+    const arg = (m[1] || "").trim().toLowerCase();
+    const modes = store.SERVER5_QR_MODES;
+    if (!arg) {
+      const current = await store.getServer5QrGen();
+      return bot.sendMessage(msg.chat.id,
+        `🔳 *Server 5 QR mode:* ${current}\n\n` +
+        "• `data` — card data + sample signature (scans, fails verification)\n" +
+        "• `nosig` — card data, empty signature (scans, no signature)\n" +
+        "• `blank` — legacy QR with empty data (scans to nothing, no error)\n" +
+        "• `unscannable` — looks like a real dense Fayda QR, cannot be scanned\n\n" +
+        `Change with: \`/qrmode <${modes.join("|")}>\``,
+        { parse_mode: "Markdown" });
+    }
+    try {
+      const mode = await store.setServer5QrGen(arg);
+      bot.sendMessage(msg.chat.id, `✅ Server 5 QR mode → ${mode}`);
+    } catch (e) {
+      bot.sendMessage(msg.chat.id, `⚠️ ${e.message}`);
+    }
+  });
+  // ── Server 5 resident Basic credential (admin). `/residentbasic` shows status,
+  // `/residentbasic <base64|resident:secret>` sets it, `clear` reverts to env. ──
+  bot.onText(/^\/residentbasic(?:\s+(.+))?\s*$/, async (msg, m) => {
+    if (!isAdmin(msg.from.id)) return;
+    const arg = (m[1] || "").trim();
+    if (!arg) {
+      const cur = await store.getResidentBasicAuth();
+      return bot.sendMessage(msg.chat.id,
+        `🔑 Resident Basic auth: ${cur ? `set (${cur.slice(0, 6)}…)` : "empty"}\n\nSet with:\n/residentbasic <base64 or resident:secret>\n(/residentbasic clear reverts to the .env value.)`);
+    }
+    await store.setResidentBasicAuth(/^clear$/i.test(arg) ? "" : arg);
+    bot.deleteMessage(msg.chat.id, msg.message_id).catch(() => {});
+    const cur = await store.getResidentBasicAuth();
+    bot.sendMessage(msg.chat.id, `✅ Resident Basic auth ${cur ? `updated (${cur.slice(0, 6)}…)` : "cleared (env fallback)"}`);
+  });
+  // ── Server 5 default switch (admin). When ON, ordinary requests with a 16-digit
+  // FAN are served by Server 5 instead of the old flow; the end user picks nothing.
+  // `/server5 on|off`, or `/server5` alone for status. ──
+  bot.onText(/^\/server5(?:\s+(on|off|status))?\s*$/i, async (msg, m) => {
+    if (!isAdmin(msg.from.id)) return;
+    const arg = String(m[1] || "").trim().toLowerCase();
+    if (arg === "on" || arg === "off") {
+      await store.setServer5Active(arg === "on");
+    }
+    const active = await store.getServer5Active();
+    const ready = Boolean(await store.getResidentBasicAuth());
+    const qr = await store.getServer5QrGen();
+    const note = active && !ready
+      ? "\n⚠️ Not usable yet — set the resident credential with /residentbasic (until then requests use the old flow)."
+      : "";
+    bot.sendMessage(msg.chat.id,
+      `🧭 Server 5 default: ${active ? "ON" : "OFF"} — ${active ? "16-digit FANs use Server 5 (12-digit FINs use the old flow)" : "everyone uses the old flow"}.\n` +
+      `Resident credential: ${ready ? "set" : "missing"} · QR mode: ${qr}\n\n` +
+      `Toggle with: /server5 on   |   /server5 off${note}`);
+  });
   bot.onText(/^\/price\s+(\d+)\s+([\d.]+|global)/i, async (msg, m) => {
     if (!isAdmin(msg.from.id)) return;
     const u = await store.setPrice(m[1], /global/i.test(m[2]) ? "" : m[2]);

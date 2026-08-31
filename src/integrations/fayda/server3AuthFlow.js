@@ -1071,7 +1071,24 @@ module.exports = {
   authenticateServerFourOtp,
   exchangeServerFourCallback,
   getServer4AuthorizeCacheInfo,
-  clearServer4AuthorizeCache
+  clearServer4AuthorizeCache,
+  // Reused by the Server 5 (resident-portal) flow — the eSignet middle
+  // (authorize page → csrf → oauth-details → authenticate → auth-code) is identical.
+  _esignet: {
+    getConfig,
+    CookieJar,
+    requestWithCookies,
+    buildBrowserHeaders,
+    buildEsignetHeaders,
+    initializeServerThreeSession,
+    runEsignetAuthenticate,
+    generatePkce,
+    randomState,
+    randomIp,
+    base64Url,
+    throwIfEsignetErrors,
+    getResponsePayload
+  }
 };
 
 
